@@ -1,7 +1,13 @@
+//! Nonblocking single-writer, multiple-reader circular buffers for sharing data across threads and processes (with possible misses by readers).
+
 #![no_std]
+
+pub(crate) mod utils;
+pub(crate) mod iter;
 
 use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
 use core::ptr::{read_volatile, write_volatile};
+use crate::utils::IndexMath;
 
 /// A convenience trait for possible items
 /// read from and written to a circular buffer.
@@ -16,29 +22,6 @@ pub struct CBuf<T: CBufItem, const SIZE: usize> {
     next: AtomicUsize,
 }
 
-/// Calculates floor(log_2(`n`)).
-const fn log2(n: usize) -> u32 {
-    if n == 0 { panic!("tried to take log2 of 0"); }
-
-    let (mut n, mut lg) = (n, 0);
-    while n > 1 {
-        n >>= 1;
-        lg += 1;
-    }
-
-    lg
-}
-
-/// Dummy trait used to satiate the Rust compiler
-/// in certain uses of a lifetime inside the concrete type
-/// used as an `impl Trait` return type.
-///
-/// Idea taken straight from [a comment in rust-users].
-///
-/// [a comment in rust-users]: https://users.rust-lang.org/t/lifetimes-in-smol-executor/59157/8?u=yandros
-pub trait Captures<'_a> {}
-impl<T: ?Sized> Captures<'_> for T {}
-
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     /// If `SIZE` is a power of two, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
@@ -46,7 +29,6 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     else { panic!("SIZE param of some CBuf is *not* a power of two") };
 
     const IDX_MASK: usize = if Self::IS_POWER_OF_TWO { SIZE - 1 } else { 0 };
-    const EXP: u32 = log2(SIZE);
 
     #[inline]
     pub fn new(filler_item: T) -> Self {
@@ -94,73 +76,6 @@ pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
     next: usize,
 }
 
-trait IndexMath: Copy {
-    fn add_index<const SIZE: usize>(self, increment: Self) -> Self;
-
-    fn sub_index<const SIZE: usize>(self, decrement: Self) -> Self;
-
-    fn next_index<const SIZE: usize>(self) -> Self;
-
-    #[inline]
-    fn incr_index<const SIZE: usize>(&mut self) {
-        *self = self.next_index::<SIZE>();
-    }
-
-    fn as_index_parts<const SIZE: usize>(self) -> (Self, Self);
-
-    fn in_range<const SIZE: usize>(self, base: Self, len: Self) -> bool;
-}
-
-impl IndexMath for usize {
-    #[inline]
-    fn add_index<const SIZE: usize>(self, increment: usize) -> usize {
-        if !CBuf::<(), SIZE>::IS_POWER_OF_TWO { return 0; }
-
-        let (naive_sum, wrapped) = self.overflowing_add(increment);
-
-        if !wrapped {
-            naive_sum
-        } else if naive_sum <= (usize::MAX - SIZE) {
-            naive_sum.wrapping_add(SIZE)
-        } else {
-            naive_sum.wrapping_add(SIZE.wrapping_mul(2))
-        }
-    }
-
-    #[inline]
-    fn sub_index<const SIZE: usize>(self, decrement: usize) -> usize {
-        if !CBuf::<(), SIZE>::IS_POWER_OF_TWO { return 0; }
-
-        if self >= SIZE {
-            let (mut difference, wrapped) = self.overflowing_sub(decrement);
-            if wrapped { difference = difference.wrapping_sub(SIZE); }
-            if difference < SIZE { difference = difference.wrapping_sub(SIZE); }
-            difference
-        } else {
-            self.saturating_sub(decrement)
-        }
-    }
-
-    #[inline]
-    fn next_index<const SIZE: usize>(self) -> usize { self.add_index::<SIZE>(1) }
-
-    #[inline]
-    fn as_index_parts<const SIZE: usize>(self) -> (usize, usize) {
-        (self >> CBuf::<(), SIZE>::EXP, self & CBuf::<(), SIZE>::IDX_MASK)
-    }
-
-    #[inline]
-    fn in_range<const SIZE: usize>(self, base: Self, len: Self) -> bool {
-        let end_idx = base.add_index::<SIZE>(len);
-
-        if end_idx > base {
-            (base <= self) && (self < end_idx)
-        } else {
-            (base <= self) || ((SIZE <= self) && (self < end_idx))
-        }
-    }
-}
-
 impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, SIZE>) -> Option<Self> {
         if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
@@ -187,7 +102,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     }
 
     pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a> where 'a: 'b {
-        CBufWriterIterator {
+        iter::CBufWriterIterator {
             idx: self.next.saturating_sub(SIZE),
             writer: self,
         }
@@ -251,7 +166,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     }
 
     pub fn available_items<'b>(&'b mut self, fast_forward: bool) -> impl Iterator<Item = ReadResult<T>> + 'b + Captures<'a> where 'a: 'b {
-        CBufReaderIterator {
+        iter::CBufReaderIterator {
             reader: self,
             fast_forward,
             is_done: false,
@@ -259,41 +174,15 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     }
 }
 
-struct CBufWriterIterator<'a, 'b, T: CBufItem, const SIZE: usize> where 'a: 'b {
-    writer: &'b mut CBufWriter<'a, T, SIZE>,
-    idx: usize,
-}
-
-impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufWriterIterator<'a, 'b, T, SIZE> where 'a: 'b {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.writer.next { return None; }
-
-        let old_idx = self.idx;
-        self.idx = old_idx.wrapping_add(1);
-        Some(self.writer.cbuf.buf[old_idx & CBuf::<T, SIZE>::IDX_MASK])
-    }
-}
-
-struct CBufReaderIterator<'a, 'b, T: CBufItem, const SIZE: usize> where 'a: 'b {
-    reader: &'b mut CBufReader<'a, T, SIZE>,
-    fast_forward: bool,
-    is_done: bool,
-}
-
-impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufReaderIterator<'a, 'b, T, SIZE> where 'a: 'b {
-    type Item = ReadResult<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.is_done { return None; }
-
-        match self.reader.fetch_next_item(self.fast_forward) {
-            ReadResult::None => { self.is_done = true; None }
-            i => Some(i)
-        }
-    }
-}
+/// Dummy trait used to satiate the Rust compiler
+/// in certain uses of a lifetime inside the concrete type
+/// behind a function/method's `impl Trait` return type.
+///
+/// Idea taken straight from [a comment in rust-users].
+///
+/// [a comment in rust-users]: https://users.rust-lang.org/t/lifetimes-in-smol-executor/59157/8?u=yandros
+pub trait Captures<'_a> {}
+impl<T: ?Sized> Captures<'_> for T {}
 
 #[cfg(test)]
 mod tests {
