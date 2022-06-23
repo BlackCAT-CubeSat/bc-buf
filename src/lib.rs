@@ -1,4 +1,6 @@
-//! Nonblocking single-writer, multiple-reader circular buffers for sharing data across threads and processes (with possible misses by readers).
+//! Nonblocking single-writer, multiple-reader circular buffers
+//! for sharing data across threads and processes
+//! (with possible misses by readers).
 
 #![no_std]
 
@@ -52,6 +54,14 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         write_volatile(addr_of_mut!((*p).next), AtomicUsize::new(0));
         fence(SeqCst);
     }
+
+    #[inline]
+    pub fn as_writer<'a>(&'a mut self) -> CBufWriter<'a, T, SIZE> {
+        CBufWriter {
+            next: self.next.load(SeqCst),
+            cbuf: self,
+        }
+    }
 }
 
 impl<T: CBufItem + Default, const SIZE: usize> CBuf<T, SIZE> {
@@ -87,6 +97,8 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     }
 
     pub fn add_item(&mut self, item: T) {
+        use core::ptr::addr_of_mut;
+
         #[allow(non_snake_case)]
         let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
 
@@ -94,7 +106,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         let next_next = self.next.next_index::<SIZE>();
 
         fence(SeqCst);
-        unsafe { write_volatile(&mut cbuf.buf[self.next & IDX_MASK], item) };
+        unsafe { write_volatile(addr_of_mut!(cbuf.buf[self.next & IDX_MASK]), item) };
         fence(SeqCst);
         cbuf.next.store(next_next, SeqCst);
 
@@ -131,6 +143,8 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     const NUM_READ_TRIES: u32 = 16;
 
     pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
+        use core::ptr::addr_of;
+
         use ReadResult as RR;
 
         #[allow(non_snake_case)]
@@ -142,7 +156,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         for _ in 0..Self::NUM_READ_TRIES {
             let next_0 = cbuf.next.load(SeqCst);
             fence(SeqCst);
-            let item = unsafe { read_volatile(&cbuf.buf[self.next & IDX_MASK]) };
+            let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & IDX_MASK])) };
             fence(SeqCst);
             let next_1 = cbuf.next.load(SeqCst);
 
@@ -175,7 +189,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
 }
 
 /// Dummy trait used to satiate the Rust compiler
-/// in certain uses of a lifetime inside the concrete type
+/// in certain uses of lifetimes inside the concrete type
 /// behind a function/method's `impl Trait` return type.
 ///
 /// Idea taken straight from [a comment in rust-users].
