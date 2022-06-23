@@ -1,172 +1,169 @@
 #![no_std]
-#![feature(generic_const_exprs)]
 
 use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
-use core::ptr::write_volatile;
-
-pub const fn unwrap(opt: Option<usize>) -> usize {
-    match opt {
-        Some(val) => val,
-        None => {
-            panic!("exponent is too large for indices to be represented as usize");
-        }
-    }
-}
+use core::ptr::{read_volatile, write_volatile};
 
 #[repr(C)]
-pub struct CBuf<T, const EXP: u32>
-where
-    T: Sized + Copy + 'static,
-    [(); unwrap(1usize.checked_shl(EXP))]: Sized,
-{
-    /// The array where items are actually stored.
-    buf: [T; unwrap(1usize.checked_shl(EXP))],
-
-    /// Index of the first element available (modulo SIZE) (unless first == last == 0).
-    first: AtomicUsize,
-
-    /// Index just after the last element available (modulo SIZE) (unless last == 0).
-    last: AtomicUsize,
+pub struct CBuf<T, const SIZE: usize> where T: Sized+Copy+'static {
+    buf: [T; SIZE],
+    next: AtomicUsize,
 }
 
-impl<T, const EXP: u32> CBuf<T, EXP>
-where
-    T: Sized + Copy + 'static,
-    [(); unwrap(1usize.checked_shl(EXP))]: Sized,
-{
-    const SIZE: usize = unwrap(1usize.checked_shl(EXP));
-    const IDX_MASK: usize = Self::SIZE - 1;
-}
+/// Calculates floor(log_2(`n`)).
+const fn log2(n: usize) -> u32 {
+    if n == 0 { panic!("tried to take log2 of 0"); }
 
-#[derive(Clone, Copy)]
-struct BufIndex<const EXP: u32> where [(); unwrap(1usize.checked_shl(EXP))]: Sized {
-    n: usize
-}
-
-impl<const EXP: u32> BufIndex<EXP> where [(); unwrap(1usize.checked_shl(EXP))]: Sized {
-    pub fn new(n: usize) -> Self {
-        BufIndex { n: n }
+    let (mut n, mut lg) = (n, 0);
+    while n > 1 {
+        n >>= 1;
+        lg += 1;
     }
 
-    // TODO: figure out proper, harder-to-misuse API
-    pub fn as_idx(self) -> usize {
-        self.n & CBuf::<(), EXP>::IDX_MASK
-    }
-
-    // TODO: figure out proper, harder-to-misuse API
-    pub fn as_usize(self) -> usize { self.n }
-
-    pub fn is_in_first_round(self) -> bool {
-        (self.n & !CBuf::<(), EXP>::IDX_MASK) == 0
-    }
+    lg
 }
 
-impl<const EXP: u32> core::ops::Add<usize> for BufIndex<EXP> where [(); unwrap(1usize.checked_shl(EXP))]: Sized {
-    type Output = Self;
+impl<T, const SIZE: usize> CBuf<T, SIZE> where T: Sized+Copy+'static {
+    /// If `SIZE` is a power of two, as it should be, this is just `true`;
+    /// otherwise, this generates a compile-time panic.
+    const IS_POWER_OF_TWO: bool = if SIZE.is_power_of_two() { true }
+    else { panic!("SIZE param of some CBuf is *not* a power of two") };
 
-    fn add(self, rhs: usize) -> Self {
-        let (next_n, wrapped) = self.n.overflowing_add(rhs);
+    const IDX_MASK: usize = if Self::IS_POWER_OF_TWO { SIZE - 1 } else { 0 };
+    const EXP: u32 = log2(SIZE);
+}
 
-        if !wrapped {
-            BufIndex { n: next_n }
+pub struct CBufWriter<'a, T, const SIZE: usize> where T: Sized+Copy+'static {
+    cbuf: &'a mut CBuf<T, SIZE>,
+    next: usize,
+}
+
+pub struct CBufReader<'a, T, const SIZE: usize> where T: Sized+Copy+'static {
+    cbuf: &'a CBuf<T, SIZE>,
+    next: usize,
+}
+
+trait IndexMath: Copy {
+    fn add_index<const SIZE: usize>(self, increment: Self) -> Self;
+
+    fn next_index<const SIZE: usize>(self) -> Self;
+
+    #[inline]
+    fn incr_index<const SIZE: usize>(&mut self) {
+        *self = self.next_index::<SIZE>();
+    }
+
+    fn as_index_parts<const SIZE: usize>(self) -> (Self, Self);
+
+    fn in_range<const SIZE: usize>(self, base: Self, len: Self) -> bool;
+}
+
+impl IndexMath for usize {
+    #[inline]
+    fn add_index<const SIZE: usize>(self, increment: usize) -> usize {
+        if !CBuf::<(), SIZE>::IS_POWER_OF_TWO { return 0; }
+
+        let (naive_sum, wrapped) = self.overflowing_add(increment);
+
+        // not quite right in the case where (self, increment) == (usize::MAX, usize::MAX).
+        if !wrapped { naive_sum } else { naive_sum.wrapping_add(SIZE) }
+    }
+
+    #[inline]
+    fn next_index<const SIZE: usize>(self) -> usize { self.add_index::<SIZE>(1) }
+
+    #[inline]
+    fn as_index_parts<const SIZE: usize>(self) -> (usize, usize) {
+        (self >> CBuf::<(), SIZE>::EXP, self & CBuf::<(), SIZE>::IDX_MASK)
+    }
+
+    #[inline]
+    fn in_range<const SIZE: usize>(self, base: Self, len: Self) -> bool {
+        let end_idx = base.add_index::<SIZE>(len);
+
+        if end_idx > base {
+            (base <= self) && (self < end_idx)
         } else {
-            BufIndex { n: next_n.wrapping_add(CBuf::<(), EXP>::SIZE) }
+            (base <= self) || ((SIZE <= self) && (self < end_idx))
         }
     }
 }
 
-impl<const EXP: u32> core::ops::AddAssign<usize> for BufIndex<EXP> where [(); unwrap(1usize.checked_shl(EXP))]: Sized {
-    fn add_assign(&mut self, rhs: usize) {
-        self.n = (*self + rhs).n;
-    }
-}
+impl<'a, T, const SIZE: usize> CBufWriter<'a, T, SIZE> where T: Sized+Copy+'static {
+    pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, SIZE>) -> Option<Self> {
+        if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
+        let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
 
-pub struct CBufWriter<T, const EXP: u32>
-where
-    T: Sized + Copy + 'static,
-    [(); unwrap(1usize.checked_shl(EXP))]: Sized,
-{
-    cbuf: &'static mut CBuf<T, EXP>,
-    first: usize,  // TODO: change these to BufIndex
-    last: usize,
-}
+        cbuf.next.store(0, SeqCst);
 
-// TODO: remove once unused
-const fn next_idx<const EXP: u32>(i: usize) -> usize where [(); unwrap(1usize.checked_shl(EXP))]: Sized {
-    let (next_i, wrapped) = i.overflowing_add(1);
-
-    if !wrapped { next_i } else { next_i.wrapping_add(CBuf::<(), EXP>::SIZE) }
-}
-
-impl<T, const EXP: u32> CBufWriter<T, EXP>
-where
-    T: Sized + Copy + 'static,
-    [(); unwrap(1usize.checked_shl(EXP))]: Sized,
-{
-    pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, EXP>) -> Option<Self> {
-        let cbuf: &'static mut CBuf<T, EXP> = cbuf.as_mut()?;
-
-        cbuf.last.store(0, SeqCst);
-        cbuf.first.store(0, SeqCst);
-
-        Some(CBufWriter { cbuf: cbuf, first: 0, last: 0 })
+        Some(CBufWriter { cbuf: cbuf, next: 0 })
     }
 
     pub fn add_item(&mut self, item: T) {
         #[allow(non_snake_case)]
-        let IDX_MASK = CBuf::<T, EXP>::IDX_MASK;
+        let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
 
         let cbuf = &mut self.cbuf;
 
-        if (self.last & !IDX_MASK) != 0 {
-            let next_first = next_idx::<EXP>(self.first);
-            let next_last = next_idx::<EXP>(self.last);
+        fence(SeqCst);
+        unsafe { write_volatile(&mut cbuf.buf[self.next & IDX_MASK], item) };
+        fence(SeqCst);
+        self.next.incr_index::<SIZE>();
+        cbuf.next.store(self.next, SeqCst);
+    }
+}
 
-            cbuf.first.store(next_first, SeqCst);
+pub enum ReadResult<T> {
+    /// Normal case; fetched next item.
+    Success(T),
+    /// Fetched an item, but we missed some number.
+    Skipped(T),
+    /// No new items are available.
+    None,
+    /// After trying a number of times, not able to read.
+    SpinFail,
+}
+
+impl<'a, T, const SIZE: usize> CBufReader<'a, T, SIZE> where T: Sized+Copy+'static {
+    pub unsafe fn from_ptr(cbuf: *const CBuf<T, SIZE>) -> Option<Self> {
+        if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
+        let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
+
+        Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst) })
+    }
+
+    const NUM_READ_TRIES: u32 = 16;
+
+    pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
+        use ReadResult as RR;
+
+        #[allow(non_snake_case)]
+        let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
+
+        let cbuf = self.cbuf;
+        let mut missed = false;
+
+        for _ in 0..Self::NUM_READ_TRIES {
+            let next_0 = cbuf.next.load(SeqCst);
             fence(SeqCst);
-            unsafe { write_volatile(&mut cbuf.buf[self.last & IDX_MASK], item) };
+            let item = unsafe { read_volatile(&cbuf.buf[self.next & IDX_MASK]) };
             fence(SeqCst);
-            cbuf.last.store(next_last, SeqCst);
+            let next_1 = cbuf.next.load(SeqCst);
 
-            self.first = next_first;
-            self.last = next_last;
-        } else {
-            let next_last = next_idx::<EXP>(self.last);
+            if next_1 == 0 { return RR::None; }
 
-            unsafe { write_volatile(&mut cbuf.buf[self.last & IDX_MASK], item) };
-            fence(SeqCst);
-            cbuf.last.store(next_last, SeqCst);
+            if next_0.in_range::<SIZE>(self.next, SIZE) && next_1.in_range::<SIZE>(self.next, SIZE) {
+                self.next.incr_index::<SIZE>();
+                return if !missed { RR::Success(item) } else { RR::Skipped(item) };
+            }
 
-            self.last = next_last;
+            // we need to play catch-up
+
+            // the following isn't quite right in cases where next_1 < SIZE.
+            //self.next = if fast_forward { next_1.wrapping_sub(1) } else { next_1.wrapping_sub(SIZE) };
+            missed = true;
         }
-    }
-}
 
-pub struct CBufReader<T, const EXP: u32>
-where
-    T: Sized + Copy + 'static,
-    [(); unwrap(1usize.checked_shl(EXP))]: Sized,
-{
-    cbuf: &'static CBuf<T, EXP>,
-    next_idx: usize, // TODO: change this to BufIndex
-}
-
-impl<T, const EXP: u32> CBufReader<T, EXP>
-where
-    T: Sized + Copy + 'static,
-    [(); unwrap(1usize.checked_shl(EXP))]: Sized,
-{
-    pub unsafe fn from_ptr(cbuf: *const CBuf<T, EXP>) -> Option<Self> {
-        let cbuf: &'static CBuf<T, EXP> = cbuf.as_ref()?;
-
-        Some(CBufReader {
-            cbuf: cbuf,
-            next_idx: cbuf.first.load(SeqCst),
-        })
-    }
-
-    pub fn read_one(&mut self) -> Option<T> {
-        unimplemented!("");
+        RR::SpinFail
     }
 }
 
