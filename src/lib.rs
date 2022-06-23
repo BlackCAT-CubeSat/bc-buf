@@ -64,8 +64,13 @@ impl IndexMath for usize {
 
         let (naive_sum, wrapped) = self.overflowing_add(increment);
 
-        // not quite right in the case where (self, increment) == (usize::MAX, usize::MAX).
-        if !wrapped { naive_sum } else { naive_sum.wrapping_add(SIZE) }
+        if !wrapped {
+            naive_sum
+        } else if naive_sum <= (usize::MAX - SIZE) {
+            naive_sum.wrapping_add(SIZE)
+        } else {
+            naive_sum.wrapping_add(SIZE).wrapping_add(SIZE)
+        }
     }
 
     #[inline]
