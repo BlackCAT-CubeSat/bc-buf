@@ -2,6 +2,9 @@
 
 use super::CBuf;
 
+#[cfg(test)]
+use std::sync::mpsc;
+
 pub(crate) trait IndexMath: Copy {
     fn add_index<const SIZE: usize>(self, increment: usize) -> Self;
 
@@ -69,6 +72,55 @@ impl IndexMath for usize {
                 (base <= self) || ((SIZE <= self) && (self < end_idx))
             }
         }
+    }
+}
+
+/// Used in multithreaded tests for reproducible sequencing of events
+/// and reporting of results.
+pub(crate) trait Sequencer<T: Send> {
+    fn wait_for_go_ahead(&self);
+
+    fn send_result(&self, result: T);
+}
+
+/// A null implementation for use everywhere except tests.
+impl<T: Send> Sequencer<T> for () {
+    #[inline(always)]
+    fn wait_for_go_ahead(&self) {}
+
+    #[inline(always)]
+    fn send_result(&self, _result: T) {}
+}
+
+#[cfg(test)]
+pub(crate) struct TestSequencer<T: Send> {
+    rcv_chan: mpsc::Receiver<()>,
+    send_chan: mpsc::Sender<T>,
+}
+
+#[cfg(test)]
+impl<T: Send> TestSequencer<T> {
+    pub(crate) fn new() -> (Self, (mpsc::Sender<()>, mpsc::Receiver<T>)) {
+        let (snd0, rcv0) = mpsc::channel::<()>();
+        let (snd1, rcv1) = mpsc::channel::<T>();
+
+        (
+            TestSequencer { rcv_chan: rcv0, send_chan: snd1 },
+            (snd0, rcv1),
+        )
+    }
+}
+
+#[cfg(test)]
+impl<T: Send> Sequencer<T> for TestSequencer<T> {
+    #[inline]
+    fn wait_for_go_ahead(&self) {
+        let _ = self.rcv_chan.recv();
+    }
+
+    #[inline]
+    fn send_result(&self, result: T) {
+        let _ = self.send_chan.send(result);
     }
 }
 

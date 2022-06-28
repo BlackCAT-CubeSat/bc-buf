@@ -4,12 +4,15 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub(crate) mod utils;
 pub(crate) mod iter;
 
 use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
 use core::ptr::{read_volatile, write_volatile};
-use crate::utils::IndexMath;
+use crate::utils::{IndexMath, Sequencer};
 
 /// A convenience trait for possible items
 /// read from and written to a circular buffer.
@@ -96,8 +99,22 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         Some(CBufWriter { cbuf: cbuf, next: 0 })
     }
 
+    #[inline(always)]
     pub fn add_item(&mut self, item: T) {
+        self.add_item_seq(item, &());
+    }
+
+    #[inline]
+    pub(crate) fn add_item_seq<S: Sequencer<()>>(&mut self, item: T, seq: &S) {
         use core::ptr::addr_of_mut;
+
+        macro_rules! wrap_atomic {
+            ($($x:tt)*) => {
+                seq.wait_for_go_ahead();
+                { $($x)* }
+                seq.send_result(());
+            };
+        }
 
         #[allow(non_snake_case)]
         let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
@@ -105,10 +122,12 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         let cbuf = &mut self.cbuf;
         let next_next = self.next.next_index::<SIZE>();
 
-        fence(SeqCst);
-        unsafe { write_volatile(addr_of_mut!(cbuf.buf[self.next & IDX_MASK]), item) };
-        fence(SeqCst);
-        cbuf.next.store(next_next, SeqCst);
+        wrap_atomic! {
+            fence(SeqCst);
+            unsafe { write_volatile(addr_of_mut!(cbuf.buf[self.next & IDX_MASK]), item) };
+            fence(SeqCst);
+        }
+        wrap_atomic! { cbuf.next.store(next_next, SeqCst); }
 
         self.next = next_next;
     }
@@ -143,42 +162,71 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
 
     const NUM_READ_TRIES: u32 = 16;
 
+    #[inline]
     pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
+        self.fetch_next_item_seq(fast_forward, &())
+    }
+
+    #[inline]
+    pub(crate) fn fetch_next_item_seq<S>(&mut self, fast_forward: bool, seq: &S) -> ReadResult<T>
+    where S: Sequencer<Option<ReadResult<T>>> {
         use core::ptr::addr_of;
 
         use ReadResult as RR;
+
+        macro_rules! wrap_atomic {
+            ($($x:tt)*) => {
+                {
+                    seq.wait_for_go_ahead();
+                    let x = { $($x)* };
+                    seq.send_result(Option::None);
+                    x
+                }
+            };
+        }
+        macro_rules! send_and_return {
+            ($result:expr) => {
+                seq.send_result(Option::Some($result));
+                return $result;
+            };
+        }
 
         #[allow(non_snake_case)]
         let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
 
         let cbuf = self.cbuf;
-        let mut missed = false;
+        let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let next_0 = cbuf.next.load(SeqCst);
-            fence(SeqCst);
-            let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & IDX_MASK])) };
-            fence(SeqCst);
-            let next_1 = cbuf.next.load(SeqCst);
+            let next_0 = wrap_atomic! { cbuf.next.load(SeqCst) };
+            let item = wrap_atomic! {
+                fence(SeqCst);
+                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & IDX_MASK])) };
+                fence(SeqCst);
+                item
+            };
+            let next_1 = wrap_atomic! { cbuf.next.load(SeqCst) };
 
-            if next_1 == 0 { return RR::None; }
-            if (self.next == next_0) && (self.next == next_1) { return RR::None; }
+            if next_1 == 0 { send_and_return!(RR::None); }
+            if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
 
             let ok_next_01_base = self.next.next_index::<SIZE>();
             if next_0.in_range::<SIZE>(ok_next_01_base, SIZE) && next_1.in_range::<SIZE>(ok_next_01_base, SIZE) {
                 self.next.incr_index::<SIZE>();
-                return if !missed { RR::Success(item) } else { RR::Skipped(item) };
+                send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
             }
 
-            // we've gotten too far behind, and we've gotten wrapped by the writer,
-            // or else the circular buffer's been re-initialized;
-            // in either case, we need to play catch-up
-            let offset = if fast_forward { 1 } else { SIZE };
-            self.next = next_1.sub_index::<SIZE>(offset);
-            missed = true;
+            if !(next_1.in_range::<SIZE>(ok_next_01_base, SIZE)) {
+                // we've gotten too far behind, and we've gotten wrapped by the writer,
+                // or else the circular buffer's been re-initialized;
+                // in either case, we need to play catch-up
+                let offset = if fast_forward { 1 } else { SIZE };
+                self.next = next_1.sub_index::<SIZE>(offset);
+                skipped = true;
+            }
         }
 
-        RR::SpinFail
+        send_and_return!(RR::SpinFail);
     }
 
     pub fn available_items<'b>(&'b mut self, fast_forward: bool) -> impl Iterator<Item = ReadResult<T>> + 'b + Captures<'a> where 'a: 'b {
@@ -203,8 +251,12 @@ impl<T: ?Sized> Captures<'_> for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::AtomicUsize;
-    use core::sync::atomic::Ordering::SeqCst;
+    use super::ReadResult as RR;
+    use core::mem::drop;
+    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::thread::spawn;
+    use std::sync::mpsc;
+    use crate::utils::TestSequencer;
 
     #[test]
     fn can_construct_cbuf() {
@@ -313,8 +365,6 @@ mod tests {
 
     #[test]
     fn write_then_read() {
-        use super::ReadResult as RR;
-
         let mut cbuf: CBuf<u32, 16> = CBuf::new_with_default();
         let cbuf_ptr: *mut CBuf<u32, 16> = &mut cbuf;
 
@@ -364,6 +414,115 @@ mod tests {
         writer.add_item(300);
         assert_eq!(reader2.fetch_next_item(true), RR::Skipped(300));
 
-        core::mem::drop(cbuf);
+        drop(cbuf);
+    }
+
+    fn step_writer(chan_pair: &(mpsc::Sender<()>, mpsc::Receiver<()>)) {
+        let (goahead, result) = chan_pair;
+        let _ = goahead.send(());
+        assert_eq!(result.recv(), Ok(()));
+    }
+
+    fn step_reader<T>(chan_pair: &(mpsc::Sender<()>, mpsc::Receiver<Option<T>>))
+    where T: Send + PartialEq + core::fmt::Debug {
+        let (goahead, result) = chan_pair;
+        let _ = goahead.send(());
+        assert_eq!(result.recv(), Ok(None));
+    }
+
+    fn expect_reader_ret<T>(chan_pair: &(mpsc::Sender<()>, mpsc::Receiver<Option<T>>), return_val: T)
+    where T: Send + PartialEq + core::fmt::Debug {
+        let (_, result) = chan_pair;
+        assert_eq!(result.recv(), Ok(Some(return_val)));
+    }
+
+    #[test]
+    fn very_simple_multithreaded() {
+        let mut cbuf: CBuf<(u8, u16), 4> = CBuf::new((0, 0));
+        let cbuf_ptr: *mut CBuf<(u8, u16), 4> = &mut cbuf;
+
+        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
+        let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+
+        let (ts_wr, chans_wr) = TestSequencer::new();
+        let (ts_rd, chans_rd) = TestSequencer::new();
+
+        let jh_wr = spawn(move || {
+            writer.add_item_seq((1, 1), &ts_wr);
+        });
+
+        let jh_rd = spawn(move || {
+            let _ = reader.fetch_next_item_seq(false, &ts_rd);
+            let _ = reader.fetch_next_item_seq(false, &ts_rd);
+        });
+
+        for _ in 0..3 { step_reader(&chans_rd); }
+        expect_reader_ret(&chans_rd, RR::None);
+
+        for _ in 0..2 { step_writer(&chans_wr); }
+        for _ in 0..3 { step_reader(&chans_rd); }
+        expect_reader_ret(&chans_rd, RR::Success((1, 1)));
+
+        for jh in [jh_wr, jh_rd] {
+            let _ = jh.join();
+        }
+
+        drop(cbuf);
+    }
+
+    #[test]
+    fn simple_interleaved_read_and_write() {
+        let mut cbuf: CBuf<i16, 4> = CBuf::new(0);
+        let cbuf_ptr: *mut CBuf<i16, 4> = &mut cbuf;
+
+        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
+        let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+
+        cbuf.buf = [-1, -2, -3, -4];
+        cbuf.next.store(0x16, SeqCst);
+        writer.next = 0x16;
+        reader.next = 0x12;
+
+        let (ts_wr, chans_wr) = TestSequencer::new();
+        let (ts_rd, chans_rd) = TestSequencer::new();
+
+        let jh_wr = spawn(move || {
+            writer.add_item_seq(42, &ts_wr);
+            writer.add_item_seq(43, &ts_wr);
+            writer.add_item_seq(44, &ts_wr);
+            writer.add_item_seq(45, &ts_wr);
+        });
+        let jh_rd = spawn(move || {
+            let _ = reader.fetch_next_item_seq(false, &ts_rd);
+            let _ = reader.fetch_next_item_seq(true, &ts_rd);
+            let _ = reader.fetch_next_item_seq(false, &ts_rd);
+        });
+
+        step_reader(&chans_rd);
+        step_writer(&chans_wr);
+        step_writer(&chans_wr);
+        step_reader(&chans_rd);
+        step_reader(&chans_rd);
+        for _ in 0..3 { step_reader(&chans_rd); }
+        expect_reader_ret(&chans_rd, RR::Skipped(-4));
+
+        step_reader(&chans_rd);
+        for _ in 0..(2*2) { step_writer(&chans_wr); }
+        step_reader(&chans_rd);
+        step_reader(&chans_rd);
+        for _ in 0..3 { step_reader(&chans_rd); }
+        expect_reader_ret(&chans_rd, RR::Skipped(44));
+
+        step_reader(&chans_rd);
+        for _ in 0..2 { step_writer(&chans_wr); }
+        for _ in 0..2 { step_reader(&chans_rd); }
+        for _ in 0..3 { step_reader(&chans_rd); }
+        expect_reader_ret(&chans_rd, RR::Success(45));
+
+        for jh in [jh_wr, jh_rd] {
+            let _ = jh.join();
+        }
+
+        drop(cbuf);
     }
 }
