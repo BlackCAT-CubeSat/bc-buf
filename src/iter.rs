@@ -38,3 +38,72 @@ impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufReaderIterator<'a,
     }
 }
 
+#[cfg(test)]
+mod iterator_tests {
+    use crate::*;
+    use core::sync::atomic::AtomicUsize;
+
+    const M4: usize = usize::MAX - 4 + 1;
+
+    fn run_test<T, const SIZE: usize>(init_buf: [T; SIZE], init_next: usize, expected_results: &[T])
+    where T: CBufItem + core::fmt::Debug + PartialEq {
+        let mut cbuf: CBuf<T, SIZE> = CBuf {
+            buf: init_buf,
+            next: AtomicUsize::new(init_next),
+        };
+
+        {
+            let mut cbuf_writer = cbuf.as_writer();
+            let mut cbuf_iter = cbuf_writer.current_items();
+            for i in expected_results {
+                assert_eq!(cbuf_iter.next(), Some(*i));
+            }
+            assert_eq!(cbuf_iter.next(), None);
+            assert_eq!(cbuf_iter.next(), None);
+        }
+
+        {
+            let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
+            let mut reader_iter = cbuf_reader.available_items(false);
+            assert_eq!(reader_iter.next(), None);
+            assert_eq!(reader_iter.next(), None);
+        }
+
+        {
+            let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
+            cbuf_reader.next = cbuf_reader.next.sub_index::<SIZE>(SIZE);
+            let mut reader_iter = cbuf_reader.available_items(false);
+            for i in expected_results {
+                assert_eq!(reader_iter.next(), Some(ReadResult::Success(*i)));
+            }
+            assert_eq!(reader_iter.next(), None);
+            assert_eq!(reader_iter.next(), None);
+        }
+    }
+
+    #[test]
+    fn nonfull_cbuf4() {
+        let buf = [1i16, 2, 3, 4];
+        run_test(buf, 0, &[]);
+        run_test(buf, 1, &[1]);
+        run_test(buf, 2, &[1, 2]);
+        run_test(buf, 3, &[1, 2, 3]);
+        run_test(buf, 4, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn full_cbuf4() {
+        let buf = [-1i16, -2, -3, -4];
+        run_test(buf, 5, &[-2, -3, -4, -1]);
+        run_test(buf, 6, &[-3, -4, -1, -2]);
+        run_test(buf, 7, &[-4, -1, -2, -3]);
+        run_test(buf, 8, &[-1, -2, -3, -4]);
+        run_test(buf, 9, &[-2, -3, -4, -1]);
+
+        run_test(buf, M4-1, &[-4, -1, -2, -3]);
+        run_test(buf, M4,   &[-1, -2, -3, -4]);
+        run_test(buf, M4+1, &[-2, -3, -4, -1]);
+        run_test(buf, M4+2, &[-3, -4, -1, -2]);
+        run_test(buf, M4+3, &[-4, -1, -2, -3]);
+    }
+}
