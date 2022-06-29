@@ -525,4 +525,51 @@ mod tests {
 
         drop(cbuf);
     }
+
+    #[test]
+    fn get_to_spinfail() {
+        #[allow(non_snake_case)]
+        let NUM_READ_TRIES = CBufReader::<(), 4096>::NUM_READ_TRIES;
+
+        let mut cbuf: CBuf<(), 4096> = CBuf::new_with_default();
+        let cbuf_ptr: *mut CBuf<(), 4096> = &mut cbuf;
+
+        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
+        let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+
+        cbuf.next.store(0x2005, SeqCst);
+        writer.next = 0x2005;
+        reader.next = 0x1005;
+
+        let (ts_wr, chans_wr) = TestSequencer::new();
+        let (ts_rd, chans_rd) = TestSequencer::new();
+
+        let join_handles = [
+            spawn(move || {
+                for _ in 0..NUM_READ_TRIES {
+                    writer.add_item_seq((), &ts_wr);
+                }
+            }),
+            spawn(move || {
+                reader.fetch_next_item_seq(false, &ts_rd);
+            })
+        ];
+
+        for _ in 0..NUM_READ_TRIES {
+            step_reader(&chans_rd);
+
+            step_writer(&chans_wr);
+            step_writer(&chans_wr);
+
+            step_reader(&chans_rd);
+            step_reader(&chans_rd);
+        }
+        expect_reader_ret(&chans_rd, RR::SpinFail);
+
+        for jh in join_handles {
+            let _ = jh.join();
+        }
+
+        drop(cbuf);
+    }
 }
