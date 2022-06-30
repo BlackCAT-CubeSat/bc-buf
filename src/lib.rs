@@ -1,3 +1,6 @@
+// Copyright (c) 2022 The Pennsylvania State University and the project contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Nonblocking single-writer, multiple-reader circular buffers
 //! for sharing data across threads and processes
 //! (with possible misses by readers).
