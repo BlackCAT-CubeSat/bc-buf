@@ -145,246 +145,255 @@ mod index_tests {
 
     impl UsizeExt for usize {}
 
+    macro_rules! test_case {
+        (+, $a:expr, $b:expr, $result:expr) => {
+            assert_eq!(($a as usize).add_index::<16>($b as usize), $result);
+        };
+        (-, $a:expr, $b:expr, $result:expr) => {
+            assert_eq!(($a as usize).sub_index::<16>($b as usize), $result);
+        };
+    }
+
     #[test]
     fn add_index_from_runup_no_wrap() {
-        assert_eq!(0usize.add_index16(0),  0usize);
-        assert_eq!(5usize.add_index16(9),  14usize);
-        assert_eq!(12usize.add_index16(7), 19usize);
-        assert_eq!(7usize.add_index16(12), 19usize);
-        assert_eq!(0usize.add_index16(16), 16usize);
+        test_case!(+,  0,  0,  0);
+        test_case!(+,  5,  9, 14);
+        test_case!(+, 12,  7, 19);
+        test_case!(+,  7, 12, 19);
+        test_case!(+,  0, 16, 16);
 
-        assert_eq!(0usize.add_index16(M-2), M-2);
-        assert_eq!(0usize.add_index16(M-1), M-1);
-        assert_eq!(0usize.add_index16(M), M);
+        test_case!(+, 0, M-2, M-2);
+        test_case!(+, 0, M-1, M-1);
+        test_case!(+, 0,   M,   M);
 
-        assert_eq!(5usize.add_index16(M-6), M-1);
-        assert_eq!(5usize.add_index16(M-5), M);
+        test_case!(+, 5, M-6, M-1);
+        test_case!(+, 5, M-5,   M);
 
-        assert_eq!(10usize.add_index16(M-11), M-1);
-        assert_eq!(10usize.add_index16(M-10), M);
+        test_case!(+, 10, M-11, M-1);
+        test_case!(+, 10, M-10,   M);
     }
 
     #[test]
     fn add_index_from_runup_wrap() {
-        assert_eq!(1usize.add_index16(M),    0x10usize);
+        test_case!(+, 1, M, 0x10);
 
-        assert_eq!(10usize.add_index16(M-9), 0x10usize);
-        assert_eq!(10usize.add_index16(M-8), 0x11usize);
-        assert_eq!(10usize.add_index16(M-2), 0x17usize);
-        assert_eq!(10usize.add_index16(M),   0x19usize);
+        test_case!(+, 10, M-9, 0x10);
+        test_case!(+, 10, M-8, 0x11);
+        test_case!(+, 10, M-2, 0x17);
+        test_case!(+, 10,   M, 0x19);
 
-        assert_eq!(15usize.add_index16(M-14), 0x10usize);
-        assert_eq!(15usize.add_index16(M),    0x1Eusize);
+        test_case!(+, 15, M-14, 0x10);
+        test_case!(+, 15,    M, 0x1E);
     }
 
     #[test]
     fn add_index_from_loop_no_wrap() {
-        assert_eq!(16usize.add_index16(0),    16usize);
-        assert_eq!(16usize.add_index16(4),    20usize);
-        assert_eq!(16usize.add_index16(M-33), M-17);
-        assert_eq!(16usize.add_index16(M-32), M-16);
-        assert_eq!(16usize.add_index16(M-30), M-14);
-        assert_eq!(16usize.add_index16(M-17), M-1);
-        assert_eq!(16usize.add_index16(M-16), M);
+        test_case!(+, 16,    0,   16);
+        test_case!(+, 16,    4,   20);
+        test_case!(+, 16, M-33, M-17);
+        test_case!(+, 16, M-32, M-16);
+        test_case!(+, 16, M-30, M-14);
+        test_case!(+, 16, M-17,  M-1);
+        test_case!(+, 16, M-16,    M);
 
-        assert_eq!(18usize.add_index16(0),    18usize);
-        assert_eq!(18usize.add_index16(8),    26usize);
-        assert_eq!(18usize.add_index16(M-20), M-2);
-        assert_eq!(18usize.add_index16(M-18), M);
+        test_case!(+, 18,    0,  18);
+        test_case!(+, 18,    8,  26);
+        test_case!(+, 18, M-20, M-2);
+        test_case!(+, 18, M-18,   M);
 
-        assert_eq!((M-10).add_index16(0),  M-10);
-        assert_eq!((M-10).add_index16(7),  M-3);
-        assert_eq!((M-10).add_index16(10), M);
+        test_case!(+, M-10,  0, M-10);
+        test_case!(+, M-10,  7,  M-3);
+        test_case!(+, M-10, 10,    M);
 
-        assert_eq!((M-1).add_index16(0), M-1);
-        assert_eq!((M-1).add_index16(1), M);
+        test_case!(+, M-1, 0, M-1);
+        test_case!(+, M-1, 1,   M);
 
-        assert_eq!(M.add_index16(0), M);
+        test_case!(+, M, 0, M);
     }
 
     #[test]
     fn add_index_from_loop_one_wrap() {
-        assert_eq!(16usize.add_index16(M-15), 0x10usize);
-        assert_eq!(16usize.add_index16(M-12), 0x13usize);
-        assert_eq!(16usize.add_index16(M-2),  0x1Dusize);
-        assert_eq!(16usize.add_index16(M),    0x1Fusize);
+        test_case!(+, 16, M-15, 0x10);
+        test_case!(+, 16, M-12, 0x13);
+        test_case!(+, 16,  M-2, 0x1D);
+        test_case!(+, 16,    M, 0x1F);
 
-        assert_eq!(20usize.add_index16(M-19), 0x10usize);
-        assert_eq!(20usize.add_index16(M-18), 0x11usize);
-        assert_eq!(20usize.add_index16(M),    0x23usize);
+        test_case!(+, 20, M-19, 0x10);
+        test_case!(+, 20, M-18, 0x11);
+        test_case!(+, 20,    M, 0x23);
 
-        assert_eq!((M-2).add_index16(3),    0x10usize);
-        assert_eq!((M-2).add_index16(4),    0x11usize);
-        assert_eq!((M-2).add_index16(16),   0x1Dusize);
-        assert_eq!((M-2).add_index16(M-15), M-2);
-        assert_eq!((M-2).add_index16(M-14), M-1);
-        assert_eq!((M-2).add_index16(M-13), M);
+        test_case!(+, M-2,    3, 0x10);
+        test_case!(+, M-2,    4, 0x11);
+        test_case!(+, M-2,   16, 0x1D);
+        test_case!(+, M-2, M-15,  M-2);
+        test_case!(+, M-2, M-14,  M-1);
+        test_case!(+, M-2, M-13,    M);
 
-        assert_eq!(M.add_index16(1),    0x10usize);
-        assert_eq!(M.add_index16(11),   0x1Ausize);
-        assert_eq!(M.add_index16(32),   0x2Fusize);
-        assert_eq!(M.add_index16(M-17), M-2);
-        assert_eq!(M.add_index16(M-15), M);
+        test_case!(+, M,    1, 0x10);
+        test_case!(+, M,   11, 0x1A);
+        test_case!(+, M,   32, 0x2F);
+        test_case!(+, M, M-17,  M-2);
+        test_case!(+, M, M-15,    M);
     }
 
     #[test]
     fn add_index_from_loop_two_wraps() {
-        assert_eq!((M-14).add_index16(M), 0x10usize);
+        test_case!(+, M-14, M, 0x10);
 
-        assert_eq!((M-12).add_index16(M-2), 0x10usize);
-        assert_eq!((M-12).add_index16(M-1), 0x11usize);
-        assert_eq!((M-12).add_index16(M),   0x12usize);
+        test_case!(+, M-12, M-2, 0x10);
+        test_case!(+, M-12, M-1, 0x11);
+        test_case!(+, M-12,   M, 0x12);
 
-        assert_eq!((M-5).add_index16(M-9), 0x10usize);
-        assert_eq!((M-5).add_index16(M-6), 0x13usize);
-        assert_eq!((M-5).add_index16(M),   0x19usize);
+        test_case!(+, M-5, M-9, 0x10);
+        test_case!(+, M-5, M-6, 0x13);
+        test_case!(+, M-5,   M, 0x19);
 
-        assert_eq!(M.add_index16(M-14), 0x10usize);
-        assert_eq!(M.add_index16(M-13), 0x11usize);
-        assert_eq!(M.add_index16(M-2),  0x1Cusize);
-        assert_eq!(M.add_index16(M),    0x1Eusize);
+        test_case!(+, M, M-14, 0x10);
+        test_case!(+, M, M-13, 0x11);
+        test_case!(+, M,  M-2, 0x1C);
+        test_case!(+, M,    M, 0x1E);
     }
 
     #[test]
     fn sub_index_from_runup_no_sat() {
-        assert_eq!(0usize.sub_index16(0), 0usize);
+        test_case!(-, 0, 0, 0);
 
-        assert_eq!(1usize.sub_index16(0), 1usize);
-        assert_eq!(1usize.sub_index16(1), 0usize);
+        test_case!(-, 1, 0, 1);
+        test_case!(-, 1, 1, 0);
 
-        assert_eq!(5usize.sub_index16(0), 5usize);
-        assert_eq!(5usize.sub_index16(1), 4usize);
-        assert_eq!(5usize.sub_index16(4), 1usize);
-        assert_eq!(5usize.sub_index16(5), 0usize);
+        test_case!(-, 5, 0, 5);
+        test_case!(-, 5, 1, 4);
+        test_case!(-, 5, 4, 1);
+        test_case!(-, 5, 5, 0);
 
-        assert_eq!(15usize.sub_index16(0),  15usize);
-        assert_eq!(15usize.sub_index16(4),  11usize);
-        assert_eq!(15usize.sub_index16(13), 2usize);
-        assert_eq!(15usize.sub_index16(15), 0usize);
+        test_case!(-, 15,  0, 15);
+        test_case!(-, 15,  4, 11);
+        test_case!(-, 15, 13,  2);
+        test_case!(-, 15, 15,  0);
     }
 
     #[test]
     fn sub_index_from_runup_sat() {
-        assert_eq!(0usize.sub_index16(1),  0usize);
-        assert_eq!(0usize.sub_index16(4),  0usize);
-        assert_eq!(0usize.sub_index16(15), 0usize);
-        assert_eq!(0usize.sub_index16(16), 0usize);
-        assert_eq!(0usize.sub_index16(17), 0usize);
-        assert_eq!(0usize.sub_index16(M-4), 0usize);
-        assert_eq!(0usize.sub_index16(M-1), 0usize);
-        assert_eq!(0usize.sub_index16(M), 0usize);
+        test_case!(-, 0,   1, 0);
+        test_case!(-, 0,   4, 0);
+        test_case!(-, 0,  15, 0);
+        test_case!(-, 0,  16, 0);
+        test_case!(-, 0,  17, 0);
+        test_case!(-, 0, M-4, 0);
+        test_case!(-, 0, M-1, 0);
+        test_case!(-, 0,   M, 0);
 
-        assert_eq!(1usize.sub_index16(2),  0usize);
-        assert_eq!(1usize.sub_index16(5),  0usize);
-        assert_eq!(1usize.sub_index16(15), 0usize);
-        assert_eq!(1usize.sub_index16(16), 0usize);
-        assert_eq!(1usize.sub_index16(17), 0usize);
-        assert_eq!(1usize.sub_index16(M-4), 0usize);
-        assert_eq!(1usize.sub_index16(M),  0usize);
+        test_case!(-, 1,   2, 0);
+        test_case!(-, 1,   5, 0);
+        test_case!(-, 1,  15, 0);
+        test_case!(-, 1,  16, 0);
+        test_case!(-, 1,  17, 0);
+        test_case!(-, 1, M-4, 0);
+        test_case!(-, 1,   M, 0);
 
-        assert_eq!(5usize.sub_index16(6), 0usize);
-        assert_eq!(5usize.sub_index16(10), 0usize);
-        assert_eq!(5usize.sub_index16(11), 0usize);
-        assert_eq!(5usize.sub_index16(32), 0usize);
-        assert_eq!(5usize.sub_index16(M),  0usize);
+        test_case!(-, 5,  6, 0);
+        test_case!(-, 5, 10, 0);
+        test_case!(-, 5, 11, 0);
+        test_case!(-, 5, 32, 0);
+        test_case!(-, 5,  M, 0);
 
-        assert_eq!(15usize.sub_index16(16),  0usize);
-        assert_eq!(15usize.sub_index16(17),  0usize);
-        assert_eq!(15usize.sub_index16(32),  0usize);
-        assert_eq!(15usize.sub_index16(100), 0usize);
-        assert_eq!(15usize.sub_index16(M-5), 0usize);
-        assert_eq!(15usize.sub_index16(M),   0usize);
+        test_case!(-, 15,  16, 0);
+        test_case!(-, 15,  17, 0);
+        test_case!(-, 15,  32, 0);
+        test_case!(-, 15, 100, 0);
+        test_case!(-, 15, M-5, 0);
+        test_case!(-, 15,   M, 0);
     }
 
     #[test]
     fn sub_index_from_loop_no_wrap() {
-        assert_eq!(16usize.sub_index16(0), 16usize);
+        test_case!(-, 16, 0, 16);
 
-        assert_eq!(17usize.sub_index16(0), 17usize);
-        assert_eq!(17usize.sub_index16(1), 16usize);
+        test_case!(-, 17, 0, 17);
+        test_case!(-, 17, 1, 16);
 
-        assert_eq!(32usize.sub_index16(0),  32usize);
-        assert_eq!(32usize.sub_index16(1),  31usize);
-        assert_eq!(32usize.sub_index16(15), 17usize);
-        assert_eq!(32usize.sub_index16(16), 16usize);
+        test_case!(-, 32,  0, 32);
+        test_case!(-, 32,  1, 31);
+        test_case!(-, 32, 15, 17);
+        test_case!(-, 32, 16, 16);
 
-        assert_eq!((M-16).sub_index16(0),  M-16);
-        assert_eq!((M-16).sub_index16(1),  M-17);
-        assert_eq!((M-16).sub_index16(16), M-32);
-        assert_eq!((M-16).sub_index16(17), M-33);
-        assert_eq!((M-16).sub_index16(M-34), 18usize);
-        assert_eq!((M-16).sub_index16(M-32), 16usize);
+        test_case!(-, M-16,    0, M-16);
+        test_case!(-, M-16,    1, M-17);
+        test_case!(-, M-16,   16, M-32);
+        test_case!(-, M-16,   17, M-33);
+        test_case!(-, M-16, M-34,   18);
+        test_case!(-, M-16, M-32,   16);
 
-        assert_eq!(M.sub_index16(0),  M);
-        assert_eq!(M.sub_index16(1),  M-1);
-        assert_eq!(M.sub_index16(14), M-14);
-        assert_eq!(M.sub_index16(15), M-15);
-        assert_eq!(M.sub_index16(16), M-16);
-        assert_eq!(M.sub_index16(M-32), 32usize);
-        assert_eq!(M.sub_index16(M-31), 31usize);
-        assert_eq!(M.sub_index16(M-20), 20usize);
-        assert_eq!(M.sub_index16(M-18), 18usize);
-        assert_eq!(M.sub_index16(M-16), 16usize);
+        test_case!(-, M,    0,    M);
+        test_case!(-, M,    1,  M-1);
+        test_case!(-, M,   14, M-14);
+        test_case!(-, M,   15, M-15);
+        test_case!(-, M,   16, M-16);
+        test_case!(-, M, M-32,   32);
+        test_case!(-, M, M-31,   31);
+        test_case!(-, M, M-20,   20);
+        test_case!(-, M, M-18,   18);
+        test_case!(-, M, M-16,   16);
     }
 
     #[test]
     fn sub_index_from_loop_one_wrap() {
-        assert_eq!(16usize.sub_index16(1),  M);
-        assert_eq!(16usize.sub_index16(2),  M-1);
-        assert_eq!(16usize.sub_index16(15), M-14);
-        assert_eq!(16usize.sub_index16(16), M-15);
-        assert_eq!(16usize.sub_index16(17), M-16);
-        assert_eq!(16usize.sub_index16(M-31), 32usize);
-        assert_eq!(16usize.sub_index16(M-16), 17usize);
-        assert_eq!(16usize.sub_index16(M-15), 16usize);
+        test_case!(-, 16,    1,    M);
+        test_case!(-, 16,    2,  M-1);
+        test_case!(-, 16,   15, M-14);
+        test_case!(-, 16,   16, M-15);
+        test_case!(-, 16,   17, M-16);
+        test_case!(-, 16, M-31,   32);
+        test_case!(-, 16, M-16,   17);
+        test_case!(-, 16, M-15,   16);
 
-        assert_eq!(17usize.sub_index16(2), M);
-        assert_eq!(17usize.sub_index16(3), M-1);
-        assert_eq!(17usize.sub_index16(16), M-14);
-        assert_eq!(17usize.sub_index16(17), M-15);
-        assert_eq!(17usize.sub_index16(18), M-16);
-        assert_eq!(17usize.sub_index16(M-30), 32usize);
-        assert_eq!(17usize.sub_index16(M-29), 31usize);
-        assert_eq!(17usize.sub_index16(M-15), 17usize);
-        assert_eq!(17usize.sub_index16(M-14), 16usize);
+        test_case!(-, 17,    2,    M);
+        test_case!(-, 17,    3,  M-1);
+        test_case!(-, 17,   16, M-14);
+        test_case!(-, 17,   17, M-15);
+        test_case!(-, 17,   18, M-16);
+        test_case!(-, 17, M-30,   32);
+        test_case!(-, 17, M-29,   31);
+        test_case!(-, 17, M-15,   17);
+        test_case!(-, 17, M-14,   16);
 
-        assert_eq!(31usize.sub_index16(M-16), 32usize);
-        assert_eq!(31usize.sub_index16(M-15), 31usize);
-        assert_eq!(31usize.sub_index16(M),    16usize);
+        test_case!(-, 31, M-16, 32);
+        test_case!(-, 31, M-15, 31);
+        test_case!(-, 31,    M, 16);
 
-        assert_eq!(32usize.sub_index16(17), M);
-        assert_eq!(32usize.sub_index16(19), M-2);
-        assert_eq!(32usize.sub_index16(M-16), 33usize);
-        assert_eq!(32usize.sub_index16(M-15), 32usize);
-        assert_eq!(32usize.sub_index16(M), 17usize);
+        test_case!(-, 32,   17,   M);
+        test_case!(-, 32,   19, M-2);
+        test_case!(-, 32, M-16,  33);
+        test_case!(-, 32, M-15,  32);
+        test_case!(-, 32,    M,  17);
 
-        assert_eq!((M-16).sub_index16(M-31), M);
-        assert_eq!((M-16).sub_index16(M-30), M-1);
-        assert_eq!((M-16).sub_index16(M-17), M-14);
-        assert_eq!((M-16).sub_index16(M-16), M-15);
+        test_case!(-, M-16, M-31,    M);
+        test_case!(-, M-16, M-30,  M-1);
+        test_case!(-, M-16, M-17, M-14);
+        test_case!(-, M-16, M-16, M-15);
 
-        assert_eq!(M.sub_index16(M-15), M);
-        assert_eq!(M.sub_index16(M-14), M-1);
-        assert_eq!(M.sub_index16(M-1),  M-14);
-        assert_eq!(M.sub_index16(M),    M-15);
+        test_case!(-, M, M-15,    M);
+        test_case!(-, M, M-14,  M-1);
+        test_case!(-, M,  M-1, M-14);
+        test_case!(-, M,    M, M-15);
     }
 
     #[test]
     fn sub_index_from_loop_two_wraps() {
-        assert_eq!(16usize.sub_index16(M-14), M);
-        assert_eq!(16usize.sub_index16(M-13), M-1);
-        assert_eq!(16usize.sub_index16(M-1), M-13);
-        assert_eq!(16usize.sub_index16(M), M-14);
+        test_case!(-, 16, M-14,    M);
+        test_case!(-, 16, M-13,  M-1);
+        test_case!(-, 16,  M-1, M-13);
+        test_case!(-, 16,    M, M-14);
 
-        assert_eq!(17usize.sub_index16(M-13), M);
-        assert_eq!(17usize.sub_index16(M-12), M-1);
-        assert_eq!(17usize.sub_index16(M-1),  M-12);
-        assert_eq!(17usize.sub_index16(M),    M-13);
+        test_case!(-, 17, M-13,    M);
+        test_case!(-, 17, M-12,  M-1);
+        test_case!(-, 17,  M-1, M-12);
+        test_case!(-, 17,    M, M-13);
 
-        assert_eq!(29usize.sub_index16(M-1), M);
-        assert_eq!(29usize.sub_index16(M),   M-1);
+        test_case!(-, 29, M-1,   M);
+        test_case!(-, 29,   M, M-1);
 
-        assert_eq!(30usize.sub_index16(M), M);
+        test_case!(-, 30, M, M);
     }
 
     macro_rules! in_range_tableau {
