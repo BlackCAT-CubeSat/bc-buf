@@ -108,14 +108,14 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     }
 
     #[inline]
-    pub(crate) fn add_item_seq<S: Sequencer<()>>(&mut self, item: T, seq: &S) {
+    pub(crate) fn add_item_seq<S: Sequencer<u32>>(&mut self, item: T, seq: &S) {
         use core::ptr::addr_of_mut;
 
         macro_rules! wrap_atomic {
-            ($($x:tt)*) => {
+            ($label:expr, $($x:tt)*) => {
                 seq.wait_for_go_ahead();
                 { $($x)* }
-                seq.send_result(());
+                seq.send_result($label);
             };
         }
 
@@ -125,12 +125,13 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         let cbuf = &mut self.cbuf;
         let next_next = self.next.next_index::<SIZE>();
 
-        wrap_atomic! {
+        wrap_atomic! { 1, }
+        wrap_atomic! { 2,
             fence(SeqCst);
             unsafe { write_volatile(addr_of_mut!(cbuf.buf[self.next & IDX_MASK]), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { cbuf.next.store(next_next, SeqCst); }
+        wrap_atomic! { 3, cbuf.next.store(next_next, SeqCst); }
 
         self.next = next_next;
     }
@@ -155,6 +156,12 @@ pub enum ReadResult<T> {
     SpinFail,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum FetchCheckpoint<T> {
+    Step(u32),
+    ReturnVal(T),
+}
+
 impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     pub unsafe fn from_ptr(cbuf: *const CBuf<T, SIZE>) -> Option<Self> {
         if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
@@ -172,24 +179,24 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
 
     #[inline]
     pub(crate) fn fetch_next_item_seq<S>(&mut self, fast_forward: bool, seq: &S) -> ReadResult<T>
-    where S: Sequencer<Option<ReadResult<T>>> {
+    where S: Sequencer<FetchCheckpoint<ReadResult<T>>> {
         use core::ptr::addr_of;
 
         use ReadResult as RR;
 
         macro_rules! wrap_atomic {
-            ($($x:tt)*) => {
+            ($label:expr, $($x:tt)*) => {
                 {
                     seq.wait_for_go_ahead();
                     let x = { $($x)* };
-                    seq.send_result(Option::None);
+                    seq.send_result(FetchCheckpoint::Step($label));
                     x
                 }
             };
         }
         macro_rules! send_and_return {
             ($result:expr) => {
-                seq.send_result(Option::Some($result));
+                seq.send_result(FetchCheckpoint::ReturnVal($result));
                 return $result;
             };
         }
@@ -201,14 +208,14 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let next_0 = wrap_atomic! { cbuf.next.load(SeqCst) };
-            let item = wrap_atomic! {
+            let next_0 = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
+            let item = wrap_atomic! { 2,
                 fence(SeqCst);
                 let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & IDX_MASK])) };
                 fence(SeqCst);
                 item
             };
-            let next_1 = wrap_atomic! { cbuf.next.load(SeqCst) };
+            let next_1 = wrap_atomic! { 3, cbuf.next.load(SeqCst) };
 
             if next_1 == 0 { send_and_return!(RR::None); }
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
@@ -420,11 +427,26 @@ mod tests {
         drop(cbuf);
     }
 
+    macro_rules! assert_let {
+        ($value:expr, $p:pat) => {
+            let val = $value;
+            if let $p = val {
+            } else {
+                panic!(
+                    r"assertion failed: `left matches right`
+  left: `{:?}`
+ right: `{}`",
+                    val, stringify!($p)
+                );
+            }
+        };
+    }
+
     macro_rules! step_writer {
         ($chan_pair:expr) => {
             let (ref goahead, ref result) = &$chan_pair;
             let _ = goahead.send(());
-            assert_eq!(result.recv(), Ok(()));
+            assert_let!(result.recv(), Ok(_));
         };
     }
 
@@ -432,14 +454,14 @@ mod tests {
         ($chan_pair:expr) => {
             let (ref goahead, ref result) = &$chan_pair;
             let _ = goahead.send(());
-            assert_eq!(result.recv(), Ok(None));
+            assert_let!(result.recv(), Ok(FetchCheckpoint::Step(_)));
         };
     }
 
     macro_rules! expect_reader_ret {
         ($chan_pair:expr, $return_val:expr) => {
             let (_, ref result) = &$chan_pair;
-            assert_eq!(result.recv(), Ok(Some($return_val)));
+            assert_eq!(result.recv(), Ok(FetchCheckpoint::ReturnVal($return_val)));
         };
     }
 
@@ -466,7 +488,7 @@ mod tests {
         for _ in 0..3 { step_reader!(chans_rd); }
         expect_reader_ret!(chans_rd, RR::None);
 
-        for _ in 0..2 { step_writer!(chans_wr); }
+        for _ in 0..3 { step_writer!(chans_wr); }
         for _ in 0..3 { step_reader!(chans_rd); }
         expect_reader_ret!(chans_rd, RR::Success((1, 1)));
 
@@ -506,22 +528,21 @@ mod tests {
         });
 
         step_reader!(chans_rd);
-        step_writer!(chans_wr);
-        step_writer!(chans_wr);
+        for _ in 0..3 { step_writer!(chans_wr); }
         step_reader!(chans_rd);
         step_reader!(chans_rd);
         for _ in 0..3 { step_reader!(chans_rd); }
         expect_reader_ret!(chans_rd, RR::Skipped(-4));
 
         step_reader!(chans_rd);
-        for _ in 0..(2*2) { step_writer!(chans_wr); }
+        for _ in 0..(2*3) { step_writer!(chans_wr); }
         step_reader!(chans_rd);
         step_reader!(chans_rd);
         for _ in 0..3 { step_reader!(chans_rd); }
         expect_reader_ret!(chans_rd, RR::Skipped(44));
 
         step_reader!(chans_rd);
-        for _ in 0..2 { step_writer!(chans_wr); }
+        for _ in 0..3 { step_writer!(chans_wr); }
         for _ in 0..2 { step_reader!(chans_rd); }
         for _ in 0..3 { step_reader!(chans_rd); }
         expect_reader_ret!(chans_rd, RR::Success(45));
@@ -565,8 +586,7 @@ mod tests {
         for _ in 0..NUM_READ_TRIES {
             step_reader!(chans_rd);
 
-            step_writer!(chans_wr);
-            step_writer!(chans_wr);
+            for _ in 0..3 { step_writer!(chans_wr); }
 
             step_reader!(chans_rd);
             step_reader!(chans_rd);
