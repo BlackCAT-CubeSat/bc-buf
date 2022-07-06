@@ -420,23 +420,27 @@ mod tests {
         drop(cbuf);
     }
 
-    fn step_writer(chan_pair: &(mpsc::Sender<()>, mpsc::Receiver<()>)) {
-        let (goahead, result) = chan_pair;
-        let _ = goahead.send(());
-        assert_eq!(result.recv(), Ok(()));
+    macro_rules! step_writer {
+        ($chan_pair:expr) => {
+            let (ref goahead, ref result) = &$chan_pair;
+            let _ = goahead.send(());
+            assert_eq!(result.recv(), Ok(()));
+        };
     }
 
-    fn step_reader<T>(chan_pair: &(mpsc::Sender<()>, mpsc::Receiver<Option<T>>))
-    where T: Send + PartialEq + core::fmt::Debug {
-        let (goahead, result) = chan_pair;
-        let _ = goahead.send(());
-        assert_eq!(result.recv(), Ok(None));
+    macro_rules! step_reader {
+        ($chan_pair:expr) => {
+            let (ref goahead, ref result) = &$chan_pair;
+            let _ = goahead.send(());
+            assert_eq!(result.recv(), Ok(None));
+        };
     }
 
-    fn expect_reader_ret<T>(chan_pair: &(mpsc::Sender<()>, mpsc::Receiver<Option<T>>), return_val: T)
-    where T: Send + PartialEq + core::fmt::Debug {
-        let (_, result) = chan_pair;
-        assert_eq!(result.recv(), Ok(Some(return_val)));
+    macro_rules! expect_reader_ret {
+        ($chan_pair:expr, $return_val:expr) => {
+            let (_, ref result) = &$chan_pair;
+            assert_eq!(result.recv(), Ok(Some($return_val)));
+        };
     }
 
     #[test]
@@ -459,12 +463,12 @@ mod tests {
             let _ = reader.fetch_next_item_seq(false, &ts_rd);
         });
 
-        for _ in 0..3 { step_reader(&chans_rd); }
-        expect_reader_ret(&chans_rd, RR::None);
+        for _ in 0..3 { step_reader!(chans_rd); }
+        expect_reader_ret!(chans_rd, RR::None);
 
-        for _ in 0..2 { step_writer(&chans_wr); }
-        for _ in 0..3 { step_reader(&chans_rd); }
-        expect_reader_ret(&chans_rd, RR::Success((1, 1)));
+        for _ in 0..2 { step_writer!(chans_wr); }
+        for _ in 0..3 { step_reader!(chans_rd); }
+        expect_reader_ret!(chans_rd, RR::Success((1, 1)));
 
         for jh in [jh_wr, jh_rd] {
             let _ = jh.join();
@@ -501,26 +505,26 @@ mod tests {
             let _ = reader.fetch_next_item_seq(false, &ts_rd);
         });
 
-        step_reader(&chans_rd);
-        step_writer(&chans_wr);
-        step_writer(&chans_wr);
-        step_reader(&chans_rd);
-        step_reader(&chans_rd);
-        for _ in 0..3 { step_reader(&chans_rd); }
-        expect_reader_ret(&chans_rd, RR::Skipped(-4));
+        step_reader!(chans_rd);
+        step_writer!(chans_wr);
+        step_writer!(chans_wr);
+        step_reader!(chans_rd);
+        step_reader!(chans_rd);
+        for _ in 0..3 { step_reader!(chans_rd); }
+        expect_reader_ret!(chans_rd, RR::Skipped(-4));
 
-        step_reader(&chans_rd);
-        for _ in 0..(2*2) { step_writer(&chans_wr); }
-        step_reader(&chans_rd);
-        step_reader(&chans_rd);
-        for _ in 0..3 { step_reader(&chans_rd); }
-        expect_reader_ret(&chans_rd, RR::Skipped(44));
+        step_reader!(chans_rd);
+        for _ in 0..(2*2) { step_writer!(chans_wr); }
+        step_reader!(chans_rd);
+        step_reader!(chans_rd);
+        for _ in 0..3 { step_reader!(chans_rd); }
+        expect_reader_ret!(chans_rd, RR::Skipped(44));
 
-        step_reader(&chans_rd);
-        for _ in 0..2 { step_writer(&chans_wr); }
-        for _ in 0..2 { step_reader(&chans_rd); }
-        for _ in 0..3 { step_reader(&chans_rd); }
-        expect_reader_ret(&chans_rd, RR::Success(45));
+        step_reader!(chans_rd);
+        for _ in 0..2 { step_writer!(chans_wr); }
+        for _ in 0..2 { step_reader!(chans_rd); }
+        for _ in 0..3 { step_reader!(chans_rd); }
+        expect_reader_ret!(chans_rd, RR::Success(45));
 
         for jh in [jh_wr, jh_rd] {
             let _ = jh.join();
@@ -559,15 +563,15 @@ mod tests {
         ];
 
         for _ in 0..NUM_READ_TRIES {
-            step_reader(&chans_rd);
+            step_reader!(chans_rd);
 
-            step_writer(&chans_wr);
-            step_writer(&chans_wr);
+            step_writer!(chans_wr);
+            step_writer!(chans_wr);
 
-            step_reader(&chans_rd);
-            step_reader(&chans_rd);
+            step_reader!(chans_rd);
+            step_reader!(chans_rd);
         }
-        expect_reader_ret(&chans_rd, RR::SpinFail);
+        expect_reader_ret!(chans_rd, RR::SpinFail);
 
         for jh in join_handles {
             let _ = jh.join();
