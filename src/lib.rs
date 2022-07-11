@@ -442,6 +442,15 @@ mod tests {
         };
     }
 
+    macro_rules! matches_pat {
+        ($value:expr, $p:pat) => {
+            match $value {
+                $p => true,
+                _ => false,
+            }
+        }
+    }
+
     macro_rules! step_writer {
         ($chan_pair:expr) => {
             let (ref goahead, ref result) = &$chan_pair;
@@ -788,10 +797,8 @@ mod tests {
     }
 
     #[test]
-    fn mini_model1() {
-        use core::num::Wrapping;
-
-        let mut i = Wrapping(0usize);
+    fn mini_model_example() {
+        let mut i = 0usize;
         iterate_over_event_sequences(
             &|| {
                 CBuf {
@@ -811,11 +818,52 @@ mod tests {
                 })
             },
             &mut |trace| {
-                std::eprintln!("{}: {:?}", i.0, trace);
+                std::eprintln!("{}: {:?}", i, trace);
                 i += 1;
                 assert!(trace.len() > 0);
             }
         );
         //panic!("panicking just so we can see the list of all traces");
+    }
+
+    /// A test case with one write and one read where neither should interfere with each other.
+    #[test]
+    fn mini_model_no_interference_1w1r() {
+        use TraceStep as TS;
+        use FetchCheckpoint as FC;
+
+        iterate_over_event_sequences(
+            &|| {
+                CBuf {
+                    buf: iota::<16>(),
+                    next: 0x14.into(),
+                }
+            },
+            &|mut reader, sequencer| {
+                spawn(move || {
+                    let _ = reader.fetch_next_item_seq(false, &sequencer);
+                })
+            },
+            0x11,
+            &|mut writer, sequencer| {
+                spawn(move || {
+                    writer.add_item_seq(42, &sequencer);
+                })
+            },
+            &mut |trace| {
+                std::eprintln!("testing {:?}", trace);
+
+                assert_eq!(
+                    trace.iter().filter(|ref t| matches_pat!(t, TS::Reader(FC::ReturnVal(_)))).count(),
+                    1
+                );
+
+                for t in trace {
+                    if let TS::Reader(FC::ReturnVal(val)) = *t {
+                        assert_eq!(val, ReadResult::Success(1));
+                    }
+                }
+            }
+        );
     }
 }
