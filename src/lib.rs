@@ -122,16 +122,15 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         #[allow(non_snake_case)]
         let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
 
-        let cbuf = &mut self.cbuf;
         let next_next = self.next.next_index::<SIZE>();
 
         wrap_atomic! { 1, }
         wrap_atomic! { 2,
             fence(SeqCst);
-            unsafe { write_volatile(addr_of_mut!(cbuf.buf[self.next & IDX_MASK]), item) };
+            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next & IDX_MASK]), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { 3, cbuf.next.store(next_next, SeqCst); }
+        wrap_atomic! { 3, self.cbuf.next.store(next_next, SeqCst); }
 
         self.next = next_next;
     }
