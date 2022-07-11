@@ -627,6 +627,8 @@ mod tests {
     RD: Fn(CBufReader<'static, T, SIZE>, TestSequencer<FetchCheckpoint<ReadResult<T>>>) -> JoinHandle<()>,
     WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<u32>) -> JoinHandle<()>,
     A: FnMut(&[TraceStep<T>]) {
+        use std::boxed::Box;
+
         #[derive(Debug, PartialEq, Eq, Clone, Copy)]
         enum EventStep {
             Reader,
@@ -636,7 +638,7 @@ mod tests {
         type ChannelPair<X> = (mpsc::Sender<()>, mpsc::Receiver<X>);
 
         struct RunningState<U, const SZ: usize> where U: CBufItem {
-            cbuf: CBuf<U, SZ>,
+            cbuf: Box<CBuf<U, SZ>>,
             trace: Vec<TraceStep<U>>,
             chans_wr: ChannelPair<u32>,
             chans_rd: ChannelPair<FetchCheckpoint<ReadResult<U>>>,
@@ -650,8 +652,8 @@ mod tests {
 
             //std::eprintln!("replaying {:?}", chain);
 
-            let mut cbuf = generator();
-            let cbuf_ptr: *mut CBuf<T, SIZE> = &mut cbuf;
+            let mut cbuf = Box::new(generator());
+            let cbuf_ptr: *mut CBuf<T, SIZE> = cbuf.as_mut();
             let mut trace: Vec<TraceStep<T>> = Vec::with_capacity(chain.len());
 
             let buf_writer = CBufWriter {
