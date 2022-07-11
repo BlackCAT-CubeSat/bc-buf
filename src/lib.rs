@@ -156,7 +156,7 @@ pub enum ReadResult<T> {
     SpinFail,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum FetchCheckpoint<T> {
     Step(u32),
     ReturnVal(T),
@@ -264,9 +264,10 @@ mod tests {
     use super::ReadResult as RR;
     use core::mem::drop;
     use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::thread::spawn;
+    use std::thread::{spawn, JoinHandle};
     use std::sync::mpsc;
     use crate::utils::TestSequencer;
+    use std::vec::Vec;
 
     #[test]
     fn can_construct_cbuf() {
@@ -598,5 +599,224 @@ mod tests {
         }
 
         drop(cbuf);
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum TraceStep<T> {
+        Reader(FetchCheckpoint<ReadResult<T>>),
+        Writer(u32),
+    }
+
+    fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
+        generator: &GEN,
+        read_thread_generator: &RD,
+        initial_read_next: usize,
+        write_thread_generator: &WR,
+        action: &mut A
+    )
+    where T: CBufItem,
+    GEN: Fn() -> CBuf<T, SIZE>,
+    RD: Fn(CBufReader<'static, T, SIZE>, TestSequencer<FetchCheckpoint<ReadResult<T>>>) -> JoinHandle<()>,
+    WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<u32>) -> JoinHandle<()>,
+    A: FnMut(&[TraceStep<T>]) {
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum EventStep {
+            Reader,
+            Writer,
+        }
+
+        type ChannelPair<X> = (mpsc::Sender<()>, mpsc::Receiver<X>);
+
+        struct RunningState<U, const SZ: usize> where U: CBufItem {
+            cbuf: CBuf<U, SZ>,
+            trace: Vec<TraceStep<U>>,
+            chans_wr: ChannelPair<u32>,
+            chans_rd: ChannelPair<FetchCheckpoint<ReadResult<U>>>,
+            jhandles: [JoinHandle<()>; 2],
+        }
+
+        // impl Fn(&[EventStep]) -> RunningState<T, SIZE>
+        let mut replay_event_chain = |chain: &[EventStep]| {
+            use EventStep as ES;
+            use TraceStep as TS;
+
+            //std::eprintln!("replaying {:?}", chain);
+
+            let mut cbuf = generator();
+            let cbuf_ptr: *mut CBuf<T, SIZE> = &mut cbuf;
+            let mut trace: Vec<TraceStep<T>> = Vec::with_capacity(chain.len());
+
+            let buf_writer = CBufWriter {
+                next: cbuf.next.load(SeqCst),
+                cbuf: unsafe { &mut *cbuf_ptr },
+            };
+            let mut buf_reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+            buf_reader.next = initial_read_next;
+
+            let (ts_wr, chans_wr) = TestSequencer::new();
+            let (ts_rd, chans_rd) = TestSequencer::new();
+
+            let jhandles = [
+                write_thread_generator(buf_writer, ts_wr),
+                read_thread_generator(buf_reader, ts_rd),
+            ];
+
+            for step in chain {
+                match step {
+                    ES::Reader => {
+                        let (goahead, result) = &chans_rd;
+                        let _ = goahead.send(());
+                        match result.recv() {
+                            Ok(r) => { trace.push(TS::Reader(r)); }
+                            Err(e) => { panic!("Unexpected error `{:?}` during replay of event chain {:?}", e, chain); }
+                        }
+                    }
+                    ES::Writer => {
+                        let (goahead, result) = &chans_wr;
+                        let _ = goahead.send(());
+                        match result.recv() {
+                            Ok(r) => { trace.push(TS::Writer(r)); }
+                            Err(e) => { panic!("Unexpected error `{:?}` during replay of event chain {:?}", e, chain); }
+                        }
+                    }
+                }
+            }
+
+            RunningState { cbuf, trace, chans_wr, chans_rd, jhandles }
+        };
+
+        let root_state = replay_event_chain(&[]);
+
+        let mut recurse_over_event_chains = |
+            event_steps: Vec<EventStep>,
+            currently_running_state: RunningState<T, SIZE>
+        | {
+            // Helper function used to allow the logic of the closure to be recursive.
+            // Technique due to <https://stackoverflow.com/a/72862424>.
+            fn helper<REC, A, T, const SIZE: usize>(
+                event_steps: Vec<EventStep>,
+                currently_running_state: RunningState<T, SIZE>,
+                replay_event_chain: &mut REC,
+                action: &mut A
+            ) where
+            T: CBufItem,
+            REC: FnMut(&[EventStep]) -> RunningState<T, SIZE>,
+            A: FnMut(&[TraceStep<T>]) {
+                use EventStep as ES;
+                use TraceStep as TS;
+
+                //std::eprintln!("recursing on {:?}", &event_steps[..]);
+
+                // Try another writer step.
+                let mut wr_events = event_steps.clone();
+                let mut wr_trace = currently_running_state.trace.clone();
+
+                let (goahead, result) = &currently_running_state.chans_wr;
+                let _ = goahead.send(());
+                match result.recv() {
+                    Err(_) => {
+                        // The writer thread has finished; run the reader to completion.
+                        let (goahead, result) = &currently_running_state.chans_rd;
+                        while let Ok(val) = { let _ = goahead.send(()); result.recv() } {
+                            wr_trace.push(TS::Reader(val));
+                        }
+                        for jh in currently_running_state.jhandles {
+                            let _ = jh.join();
+                        }
+                        drop(currently_running_state.cbuf);
+                        //std::eprintln!("applying action on trace {:?}", &wr_events[..]);
+                        action(&wr_trace);
+
+                        // "Try another reader step" below would just
+                        // repeat this sequence of events, so there's
+                        // no need to run it.
+                        return;
+                    }
+                    Ok(val) => {
+                        wr_trace.push(TS::Writer(val));
+                        wr_events.push(ES::Writer);
+                        helper(wr_events, RunningState { trace: wr_trace, ..currently_running_state }, replay_event_chain, action);
+                    }
+                }
+
+                // Try another reader step.
+                // We consumed the passed-in threads in "try another writer step",
+                // so we need to recreate them first.
+                let mut reader_state = replay_event_chain(&event_steps);
+                let mut reader_events = event_steps.clone();
+
+                let (goahead, result) = &reader_state.chans_rd;
+                let _ = goahead.send(());
+                match result.recv() {
+                    Err(_) => {
+                        // The reader thread has finished. Wind up execution.
+                        let (goahead, result) = &reader_state.chans_wr;
+                        while let Ok(_) = { let _ = goahead.send(()); result.recv() } {}
+                        for jh in reader_state.jhandles {
+                            let _ = jh.join();
+                        }
+                        drop(reader_state.cbuf);
+
+                        // If the situation was symmetrical between reader and writer,
+                        // we'd now call action()... but we've already done that with
+                        // this particular sequence of events in the recursion in
+                        // "try another writer step" above, so we'd just be repeating
+                        // that sequence.
+                        return;
+                    }
+                    Ok(val) => {
+                        reader_state.trace.push(TS::Reader(val));
+                        reader_events.push(ES::Reader);
+                        helper(reader_events, reader_state, replay_event_chain, action);
+                    }
+                }
+            }
+            helper(event_steps, currently_running_state, &mut replay_event_chain, action);
+        };
+
+        recurse_over_event_chains(Vec::new(), root_state);
+    }
+
+    // named after the unary iota function in APL
+    const fn iota<const SIZE: usize>() -> [u32; SIZE] {
+        let mut x = [0u32; SIZE];
+        let mut i = 0;
+        while i < SIZE {
+            x[i] = i as u32;
+            i += 1;
+        }
+        x
+    }
+
+    #[test]
+    fn mini_model1() {
+        use core::num::Wrapping;
+
+        let mut i = Wrapping(0usize);
+        iterate_over_event_sequences(
+            &|| {
+                CBuf {
+                    buf: iota::<16>(),
+                    next: 0x14.into()
+                }
+            },
+            &|mut reader, sequencer| {
+                spawn(move || {
+                    let _ = reader.fetch_next_item_seq(false, &sequencer);
+                })
+            },
+            0x13,
+            &|mut writer, sequencer| {
+                spawn(move || {
+                    writer.add_item_seq(42, &sequencer);
+                })
+            },
+            &mut |trace| {
+                std::eprintln!("{}: {:?}", i.0, trace);
+                i += 1;
+                assert!(trace.len() > 0);
+            }
+        );
+        //panic!("panicking just so we can see the list of all traces");
     }
 }
