@@ -431,15 +431,14 @@ mod tests {
     macro_rules! assert_let {
         ($value:expr, $p:pat) => {
             let val = $value;
-            if let $p = val {
-            } else {
-                panic!(
-                    r"assertion failed: `left matches right`
+            match val {
+                $p => (),
+                _ => panic!(r"assertion failed: `left matches right`
   left: `{:?}`
  right: `{}`",
                     val, stringify!($p)
-                );
-            }
+                )
+            };
         };
     }
 
