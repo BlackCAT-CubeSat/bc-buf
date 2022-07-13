@@ -845,6 +845,8 @@ mod tests {
             &mut |trace| {
                 std::eprintln!("testing {:?}", trace);
 
+                assert!(trace.len() > 0);
+
                 assert_eq!(
                     trace.iter().filter(|ref t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
                     1
@@ -853,6 +855,111 @@ mod tests {
                 for t in trace {
                     if let TS::Reader(FC::ReturnVal(val)) = *t {
                         assert_eq!(val, ReadResult::Success(1));
+                    }
+                }
+            }
+        );
+    }
+
+    trait SliceExt {
+        type Item;
+
+        fn prev_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item>;
+        fn next_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item>;
+    }
+
+    impl<T: Clone> SliceExt for [T] {
+        type Item = T;
+
+        fn prev_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item> {
+            let mut i = index;
+            while i > 0 {
+                i -= 1;
+                if predicate(&self[i]) {
+                    return Some(self[i].clone());
+                }
+            }
+            None
+        }
+
+        fn next_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item> {
+            for i in &self[(index+1)..] {
+                if predicate(i) {
+                    return Some(i.clone());
+                }
+            }
+            None
+        }
+    }
+
+    macro_rules! prev_with_pat {
+        ($array:expr, $index:expr, $pattern:pat) => {
+            $array.prev_with($index, |ref item| matches!(item, $pattern))
+        }
+    }
+
+    macro_rules! next_with_pat {
+        ($array:expr, $index:expr, $pattern:pat) => {
+            $array.next_with($index, |ref item| matches!(item, $pattern))
+        }
+    }
+
+    /// A test case with one write and one read where interference is possible in some cases.
+    #[test]
+    fn mini_model_interference_1w1r() {
+        use TraceStep as TS;
+        use FetchCheckpoint as FC;
+
+        iterate_over_event_sequences(
+            &|| {
+                CBuf {
+                    buf: iota::<16>(),
+                    next: 0x24.into(),
+                }
+            },
+            &|mut reader, sequencer| {
+                spawn(move || {
+                    let _ = reader.fetch_next_item_seq(false, &sequencer);
+                })
+            },
+            0x14,
+            &|mut writer, sequencer| {
+                spawn(move || {
+                    writer.add_item_seq(42, &sequencer);
+                })
+            },
+            &mut |trace| {
+                std::eprintln!("testing {:?}", trace);
+
+                assert!(trace.len() > 0);
+
+                // there should be one return from fetch_next_item_seq() :)
+                assert_eq!(
+                    trace.iter().filter(|t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
+                    1
+                );
+
+                for (i, t) in trace.iter().enumerate() {
+                    // if we read from the buffer entry in a temporal interval
+                    // containing a write to that entry, make sure we read again afterward:
+                    if *t == TS::Reader(FC::Step(2)) {
+                        match prev_with_pat!(trace, i, TS::Writer(_)) {
+                            Some(TS::Writer(1)) | Some(TS::Writer(2)) => {
+                                assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(2))).is_some());
+                            }
+                            _ => (),
+                        }
+                    }
+
+                    // the last read should occur either before the write sequence starts
+                    // or after the write sequence ends.
+                    if *t == TS::Reader(FC::Step(2)) && next_with_pat!(trace, i, TS::Reader(FC::Step(2))) == None {
+                        let prev_write_step = prev_with_pat!(trace, i, TS::Writer(_));
+                        let next_write_step = next_with_pat!(trace, i, TS::Writer(_));
+
+                        assert!((prev_write_step == Some(TS::Writer(3)) && next_write_step == None)
+                             || (prev_write_step == None && next_write_step == Some(TS::Writer(1))),
+                            "last read should be entirely before or entirely after write sequence");
                     }
                 }
             }
