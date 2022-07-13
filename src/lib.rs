@@ -441,15 +441,6 @@ mod tests {
         };
     }
 
-    macro_rules! matches_pat {
-        ($value:expr, $p:pat) => {
-            match $value {
-                $p => true,
-                _ => false,
-            }
-        }
-    }
-
     macro_rules! step_writer {
         ($chan_pair:expr) => {
             let (ref goahead, ref result) = &$chan_pair;
@@ -855,7 +846,7 @@ mod tests {
                 std::eprintln!("testing {:?}", trace);
 
                 assert_eq!(
-                    trace.iter().filter(|ref t| matches_pat!(t, TS::Reader(FC::ReturnVal(_)))).count(),
+                    trace.iter().filter(|ref t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
                     1
                 );
 
