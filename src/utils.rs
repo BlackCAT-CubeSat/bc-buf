@@ -156,76 +156,6 @@ impl<const SIZE: usize> AtomicIndex<SIZE> {
     }
 }
 
-pub(crate) trait IndexMath: Copy {
-    fn add_index<const SIZE: usize>(self, increment: usize) -> Self;
-
-    fn sub_index<const SIZE: usize>(self, decrement: usize) -> Self;
-
-    #[inline]
-    fn next_index<const SIZE: usize>(self) -> Self {
-        self.add_index::<SIZE>(1)
-    }
-
-    #[inline]
-    fn incr_index<const SIZE: usize>(&mut self) {
-        *self = self.next_index::<SIZE>();
-    }
-
-    fn in_range<const SIZE: usize>(self, base: Self, len: usize) -> bool;
-}
-
-impl IndexMath for usize {
-    #[inline]
-    fn add_index<const SIZE: usize>(self, increment: usize) -> usize {
-        if !CBuf::<(), SIZE>::IS_SIZE_OK { return 0; }
-
-        let (naive_sum, wrapped) = self.overflowing_add(increment);
-
-        if !wrapped {
-            naive_sum
-        } else if naive_sum <= (usize::MAX - SIZE) {
-            naive_sum.wrapping_add(SIZE)
-        } else {
-            naive_sum.wrapping_add(SIZE.wrapping_mul(2))
-        }
-    }
-
-    #[inline]
-    fn sub_index<const SIZE: usize>(self, decrement: usize) -> usize {
-        if !CBuf::<(), SIZE>::IS_SIZE_OK { return 0; }
-
-        if self >= SIZE {
-            let (mut difference, wrapped) = self.overflowing_sub(decrement);
-            if wrapped { difference = difference.wrapping_sub(SIZE); }
-            if difference < SIZE { difference = difference.wrapping_sub(SIZE); }
-            difference
-        } else {
-            self.saturating_sub(decrement)
-        }
-    }
-
-    #[inline]
-    fn in_range<const SIZE: usize>(self, base: Self, len: Self) -> bool {
-        #[allow(non_snake_case)]
-        let LOOP_LENGTH: usize = usize::MAX - SIZE + 1;
-
-        if base < SIZE {
-            let (end_idx, overflow) = base.overflowing_add(len);
-            (base <= self) && (overflow || (self < end_idx))
-        } else if len >= LOOP_LENGTH {
-            SIZE <= self
-        } else {
-            let end_idx = base.add_index::<SIZE>(len);
-
-            if end_idx >= base {
-                (base <= self) && (self < end_idx)
-            } else {
-                (base <= self) || ((SIZE <= self) && (self < end_idx))
-            }
-        }
-    }
-}
-
 /// Used in multithreaded tests for reproducible sequencing of events
 /// and reporting of results.
 pub(crate) trait Sequencer<T: Send> {
@@ -277,34 +207,20 @@ impl<T: Send> Sequencer<T> for TestSequencer<T> {
 
 #[cfg(test)]
 mod index_tests {
-    use super::IndexMath;
     use super::BufIndex;
 
     const M: usize = usize::MAX;
 
-    trait UsizeExt: IndexMath {
-        fn add_index16(self, increment: usize) -> Self {
-            self.add_index::<16>(increment)
-        }
-
-        fn sub_index16(self, decrement: usize) -> Self {
-            self.sub_index::<16>(decrement)
-        }
-    }
-
-    impl UsizeExt for usize {}
 
     macro_rules! test_case {
         (@ 16, $a:expr, $op:literal, $b:expr, $result:expr) => {
             concat!("(<16>(", stringify!($a), ") ", $op, " (", stringify!($b), ") == ", stringify!($result), ")")
         };
         (+, $a:expr, $b:expr, $result:expr) => {
-            assert_eq!(($a as usize).add_index::<16>($b as usize), $result);
             assert_eq!(BufIndex::<16>::new($a) + ($b as usize), BufIndex::<16>::new($result),
                 test_case!(@ 16, $a, "+", $b, $result));
         };
         (-, $a:expr, $b:expr, $result:expr) => {
-            assert_eq!(($a as usize).sub_index::<16>($b as usize), $result);
             assert_eq!(BufIndex::<16>::new($a) - ($b as usize), BufIndex::<16>::new($result),
                 test_case!(@ 16, $a, "-", $b, $result));
         };
@@ -552,7 +468,7 @@ mod index_tests {
         test_case!(-, 30, M, M);
     }
 
-    fn trim_top_bit(x: usize) -> usize {
+    const fn trim_top_bit(x: usize) -> usize {
         x & !(1 << (usize::BITS - 1))
     }
 
@@ -561,12 +477,10 @@ mod index_tests {
             concat!("<16>((", stringify!($a), ").in_range(", stringify!($b), ", ", stringify!($c), ") == ", stringify!($result), ")")
         };
         (@ 0 $a:expr , $b:expr, $c:expr, T) => {
-            assert!(($a as usize).in_range::<16>($b, $c) == true);
             assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), trim_top_bit($c)) == true,
                 in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 0 $a:expr , $b:expr, $c:expr, F) => {
-            assert!(($a as usize).in_range::<16>($b, $c) == false);
             assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), trim_top_bit($c)) == false,
                 in_range_tableau!(@ @ $a, $b, $c, true));
         };
@@ -588,11 +502,16 @@ mod index_tests {
     #[test]
     fn in_range() {
         // Some especially interesting edge cases:
-        assert!(!(0usize.in_range::<16>(0, 0)));
-        assert!(!(17usize.in_range::<16>(17, 0)));
-        assert!(16usize.in_range::<16>(1, M));
-        assert!(17usize.in_range::<16>(16, M-2));
-        assert!(16usize.in_range::<16>(16, M-15));
+        fn buf_index(x: usize) -> BufIndex<16> {
+            BufIndex::new(x)
+        }
+        const MM: usize = trim_top_bit(M);
+
+        assert!(!(buf_index(0).is_in_range(buf_index(0), 0)));
+        assert!(!(buf_index(17).is_in_range(buf_index(17), 0)));
+        assert!(buf_index(16).is_in_range(buf_index(1), MM));
+        assert!(buf_index(17).is_in_range(buf_index(16), MM-2));
+        assert!(buf_index(16).is_in_range(buf_index(16), MM-15));
 
         //in_range_tableau!(@ 0 0, 0, 1, T);
         //in_range_tableau!(@ 1 0 ; (0, 0) (0, 1) (1, 1) ; F T F);
