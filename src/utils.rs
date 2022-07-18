@@ -5,8 +5,96 @@
 
 use super::CBuf;
 
+use core::ops::{Add, Sub};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 #[cfg(test)]
 use std::sync::mpsc;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BufIndex<const SIZE: usize> {
+    /// A [`usize`], pre-shifted so the low-order bit's available.
+    idx: usize
+}
+
+impl<const SIZE: usize> BufIndex<SIZE> {
+    const IS_SIZE_OK: bool = CBuf::<(), SIZE>::IS_SIZE_OK;
+    const IDX_MASK: usize = CBuf::<(), SIZE>::IDX_MASK;
+    const SCALED_SIZE: usize = SIZE << 1;
+
+    #[inline]
+    pub const fn new(raw_val: usize) -> Self {
+        if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
+
+        Self { idx: raw_val << 1 }
+    }
+
+    #[inline]
+    pub const fn as_usize(self) -> usize {
+        self.idx >> 1
+    }
+}
+
+impl<const SIZE: usize> Default for BufIndex<SIZE> {
+    #[inline]
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: usize) -> Self {
+        unimplemented!();
+    }
+}
+
+impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: usize) -> Self {
+        unimplemented!();
+    }
+}
+
+impl<const SIZE: usize> BufIndex<SIZE> {
+    pub const fn is_in_range(self, base: Self, len: usize) -> bool {
+        unimplemented!();
+    }
+}
+
+#[repr(transparent)]
+pub(crate) struct AtomicIndex<const SIZE: usize> {
+    n: AtomicUsize
+}
+
+const fn index_to_components<const SIZE: usize>(idx: usize) -> (BufIndex<SIZE>, bool) {
+    (BufIndex { idx: idx & !0b01  }, (idx & 0b01) != 0)
+}
+
+const fn components_to_index<const SIZE: usize>(idx: BufIndex<SIZE>, is_writing: bool) -> usize {
+    idx.idx | (is_writing as usize)
+}
+
+impl<const SIZE: usize> AtomicIndex<SIZE> {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self { n: AtomicUsize::new(0) }
+    }
+
+    #[inline]
+    pub(crate) fn load(&self, order: Ordering) -> (BufIndex<SIZE>, bool) {
+        index_to_components(self.n.load(order))
+    }
+
+    #[inline]
+    pub(crate) fn store(&self, idx: BufIndex<SIZE>, is_writing: bool, order: Ordering) {
+        self.n.store(components_to_index(idx, is_writing), order);
+    }
+}
 
 pub(crate) trait IndexMath: Copy {
     fn add_index<const SIZE: usize>(self, increment: usize) -> Self;
@@ -130,6 +218,7 @@ impl<T: Send> Sequencer<T> for TestSequencer<T> {
 #[cfg(test)]
 mod index_tests {
     use super::IndexMath;
+    use super::BufIndex;
 
     const M: usize = usize::MAX;
 
@@ -148,9 +237,11 @@ mod index_tests {
     macro_rules! test_case {
         (+, $a:expr, $b:expr, $result:expr) => {
             assert_eq!(($a as usize).add_index::<16>($b as usize), $result);
+            assert_eq!(BufIndex::<16>::new($a) + ($b as usize), BufIndex::<16>::new($result));
         };
         (-, $a:expr, $b:expr, $result:expr) => {
             assert_eq!(($a as usize).sub_index::<16>($b as usize), $result);
+            assert_eq!(BufIndex::<16>::new($a) - ($b as usize), BufIndex::<16>::new($result));
         };
     }
 
@@ -399,9 +490,11 @@ mod index_tests {
     macro_rules! in_range_tableau {
         (@ 0 $a:expr , $b:expr, $c:expr, T) => {
             assert!(($a as usize).in_range::<16>($b, $c) == true);
+            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == true);
         };
         (@ 0 $a:expr , $b:expr, $c:expr, F) => {
             assert!(($a as usize).in_range::<16>($b, $c) == false);
+            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == false);
         };
         (@ 1 $a:expr ; ( $( ($b:expr, $c:expr) ),* ) ; ( $( $d:ident ),* )) => {
             $( in_range_tableau!(@ 0 $a, $b, $c, $d); )*
