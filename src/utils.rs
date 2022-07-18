@@ -5,7 +5,7 @@
 
 use super::CBuf;
 
-use core::ops::{Add, Sub};
+use core::ops::{Add, Sub, AddAssign, SubAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -19,7 +19,6 @@ pub struct BufIndex<const SIZE: usize> {
 
 impl<const SIZE: usize> BufIndex<SIZE> {
     const IS_SIZE_OK: bool = CBuf::<(), SIZE>::IS_SIZE_OK;
-    const IDX_MASK: usize = CBuf::<(), SIZE>::IDX_MASK;
     const SCALED_SIZE: usize = SIZE << 1;
     const MAX: usize = usize::MAX & !0b01;
 
@@ -29,6 +28,8 @@ impl<const SIZE: usize> BufIndex<SIZE> {
 
         Self { idx: raw_val << 1 }
     }
+
+    pub const ZERO: Self = Self::new(0);
 
     #[inline]
     pub const fn as_usize(self) -> usize {
@@ -64,6 +65,13 @@ impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
     }
 }
 
+impl<const SIZE: usize> AddAssign<usize> for BufIndex<SIZE> {
+    #[inline]
+    fn add_assign(&mut self, increment: usize) {
+        *self = *self + increment;
+    }
+}
+
 impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
     type Output = Self;
 
@@ -82,6 +90,13 @@ impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
             self.idx.saturating_sub(scaled_decrement)
         };
         Self { idx: result }
+    }
+}
+
+impl<const SIZE: usize> SubAssign<usize> for BufIndex<SIZE> {
+    #[inline]
+    fn sub_assign(&mut self, decrement: usize) {
+        *self = *self - decrement;
     }
 }
 
@@ -126,8 +141,8 @@ const fn components_to_index<const SIZE: usize>(idx: BufIndex<SIZE>, is_writing:
 
 impl<const SIZE: usize> AtomicIndex<SIZE> {
     #[inline]
-    pub(crate) const fn new() -> Self {
-        Self { n: AtomicUsize::new(0) }
+    pub(crate) const fn new(n: usize) -> Self {
+        Self { n: AtomicUsize::new(n << 1) }
     }
 
     #[inline]

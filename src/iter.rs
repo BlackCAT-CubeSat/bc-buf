@@ -14,7 +14,7 @@ impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufWriterIterator<'a,
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.writer.next { return None; }
+        if self.idx == self.writer.next.as_usize() { return None; }
 
         let old_idx = self.idx;
         self.idx = old_idx.wrapping_add(1);
@@ -44,7 +44,7 @@ impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufReaderIterator<'a,
 #[cfg(test)]
 mod iterator_tests {
     use crate::*;
-    use core::sync::atomic::AtomicUsize;
+    use crate::utils::AtomicIndex;
 
     const M4: usize = usize::MAX - 4 + 1;
 
@@ -52,7 +52,7 @@ mod iterator_tests {
     where T: CBufItem + core::fmt::Debug + PartialEq {
         let mut cbuf: CBuf<T, SIZE> = CBuf {
             buf: init_buf,
-            next: AtomicUsize::new(init_next),
+            next: AtomicIndex::new(init_next),
         };
 
         {
@@ -74,7 +74,7 @@ mod iterator_tests {
 
         {
             let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
-            cbuf_reader.next = cbuf_reader.next.sub_index::<SIZE>(SIZE);
+            cbuf_reader.next = cbuf_reader.next - SIZE;
             let mut reader_iter = cbuf_reader.available_items(false);
             for i in expected_results {
                 assert_eq!(reader_iter.next(), Some(ReadResult::Success(*i)));

@@ -13,9 +13,9 @@ extern crate std;
 pub(crate) mod utils;
 pub(crate) mod iter;
 
-use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
+use core::sync::atomic::{fence, Ordering::SeqCst};
 use core::ptr::{read_volatile, write_volatile};
-use crate::utils::{IndexMath, Sequencer};
+use crate::utils::{BufIndex, Sequencer, AtomicIndex};
 
 /// A convenience trait for possible items
 /// read from and written to a circular buffer.
@@ -27,25 +27,25 @@ impl<T> CBufItem for T where T: Sized + Copy + Send + 'static {}
 #[repr(C)]
 pub struct CBuf<T: CBufItem, const SIZE: usize> {
     buf: [T; SIZE],
-    next: AtomicUsize,
+    next: AtomicIndex<SIZE>,
 }
 
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     /// If `SIZE` is a power of two that's greater than 1 and less than
-    /// 2<sup>[`NBITS`](usize::NBITS)`-1`</sup>, as it should be, this is just `true`;
+    /// 2<sup>[`usize::BITS`]`-1`</sup>, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
-    const IS_SIZE_OK: bool = if (SIZE.is_power_of_two() && SIZE < (usize::MAX >> 1) && SIZE > 1) { true }
+    const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE < (usize::MAX >> 1) && SIZE > 1 { true }
     else { panic!("SIZE param of some CBuf is *not* an allowed value") };
 
     const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
 
     #[inline]
     pub fn new(filler_item: T) -> Self {
-        let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 0 };
+        let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 1 };
 
         CBuf {
             buf: [filler_item; SIZE],
-            next: AtomicUsize::new(initial_next),
+            next: AtomicIndex::new(initial_next),
         }
     }
 
@@ -58,14 +58,14 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         for i in 0..SIZE {
             write_volatile(addr_of_mut!((*p).buf[i]), filler_item);
         }
-        write_volatile(addr_of_mut!((*p).next), AtomicUsize::new(0));
+        write_volatile(addr_of_mut!((*p).next), AtomicIndex::new(0));
         fence(SeqCst);
     }
 
     #[inline]
     pub fn as_writer<'a>(&'a mut self) -> CBufWriter<'a, T, SIZE> {
         CBufWriter {
-            next: self.next.load(SeqCst),
+            next: self.next.load(SeqCst).0,
             cbuf: self,
         }
     }
@@ -85,12 +85,12 @@ impl<T: CBufItem + Default, const SIZE: usize> CBuf<T, SIZE> {
 
 pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
     cbuf: &'a mut CBuf<T, SIZE>,
-    next: usize,
+    next: BufIndex<SIZE>,
 }
 
 pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
     cbuf: &'a CBuf<T, SIZE>,
-    next: usize,
+    next: BufIndex<SIZE>,
 }
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
@@ -101,9 +101,9 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
 
-        cbuf.next.store(0, SeqCst);
+        cbuf.next.store(BufIndex::ZERO, false, SeqCst);
 
-        Some(CBufWriter { cbuf: cbuf, next: 0 })
+        Some(CBufWriter { cbuf: cbuf, next: BufIndex::ZERO })
     }
 
     #[inline(always)]
@@ -123,22 +123,22 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
             };
         }
 
-        let next_next = self.next.next_index::<SIZE>();
+        let next_next = self.next + 1;
 
         wrap_atomic! { 1, }
         wrap_atomic! { 2,
             fence(SeqCst);
-            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next & Self::IDX_MASK]), item) };
+            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next.as_usize() & Self::IDX_MASK]), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { 3, self.cbuf.next.store(next_next, SeqCst); }
+        wrap_atomic! { 3, self.cbuf.next.store(next_next, false, SeqCst); }
 
         self.next = next_next;
     }
 
     pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a> where 'a: 'b {
         iter::CBufWriterIterator {
-            idx: self.next.saturating_sub(SIZE),
+            idx: self.next.as_usize().saturating_sub(SIZE),
             writer: self,
         }
     }
@@ -170,7 +170,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
 
-        Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst) })
+        Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst).0 })
     }
 
     const NUM_READ_TRIES: u32 = 16;
@@ -208,30 +208,30 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let next_0 = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
+            let (next_0, _) = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
             let item = wrap_atomic! { 2,
                 fence(SeqCst);
-                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & Self::IDX_MASK])) };
+                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next.as_usize() & Self::IDX_MASK])) };
                 fence(SeqCst);
                 item
             };
-            let next_1 = wrap_atomic! { 3, cbuf.next.load(SeqCst) };
+            let (next_1, _) = wrap_atomic! { 3, cbuf.next.load(SeqCst) };
 
-            if next_1 == 0 { send_and_return!(RR::None); }
+            if next_1 == BufIndex::ZERO { send_and_return!(RR::None); }
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
 
-            let ok_next_01_base = self.next.next_index::<SIZE>();
-            if next_0.in_range::<SIZE>(ok_next_01_base, SIZE) && next_1.in_range::<SIZE>(ok_next_01_base, SIZE) {
-                self.next.incr_index::<SIZE>();
+            let ok_next_01_base = self.next + 1;
+            if next_0.is_in_range(ok_next_01_base, SIZE) && next_1.is_in_range(ok_next_01_base, SIZE) {
+                self.next += 1;
                 send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
             }
 
-            if !(next_1.in_range::<SIZE>(ok_next_01_base, SIZE)) {
+            if !(next_1.is_in_range(ok_next_01_base, SIZE)) {
                 // we've gotten too far behind, and we've gotten wrapped by the writer,
                 // or else the circular buffer's been re-initialized;
                 // in either case, we need to play catch-up
                 let offset = if fast_forward { 1 } else { SIZE };
-                self.next = next_1.sub_index::<SIZE>(offset);
+                self.next = next_1 - offset;
                 skipped = true;
             }
         }
@@ -263,7 +263,7 @@ mod tests {
     use super::*;
     use super::ReadResult as RR;
     use core::mem::drop;
-    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use core::sync::atomic::Ordering::SeqCst;
     use std::thread::{spawn, JoinHandle};
     use std::sync::mpsc;
     use crate::utils::TestSequencer;
@@ -273,7 +273,7 @@ mod tests {
     fn can_construct_cbuf() {
         let a: CBuf<u32, 256> = CBuf::new(42);
 
-        assert_eq!(a.next.load(SeqCst), 0usize);
+        assert_eq!(a.next.load(SeqCst).0.as_usize(), 0usize);
         assert_eq!(a.buf.len(), 256);
         assert!(a.buf.iter().all(|x| *x == 42u32));
 
@@ -285,7 +285,7 @@ mod tests {
 
         let e: CBuf<isize, 128> = CBuf::new_with_default();
 
-        assert_eq!(e.next.load(SeqCst), 0usize);
+        assert_eq!(e.next.load(SeqCst).0.as_usize(), 0usize);
         assert_eq!(e.buf.len(), 128);
         assert!(e.buf.iter().all(|x| *x == <isize as Default>::default()));
     }
@@ -300,7 +300,7 @@ mod tests {
             un_cb.assume_init()
         };
 
-        assert_eq!(cb.next.load(SeqCst), 0usize);
+        assert_eq!(cb.next.load(SeqCst).0.as_usize(), 0usize);
         assert!(cb.buf.iter().all(|x| *x == 1729));
     }
 
@@ -311,12 +311,12 @@ mod tests {
             item: i16,
             final_buffer: [i16; 4], final_next: usize
         ) {
-            let mut buf: CBuf<i16, 4> = CBuf { buf: initial_buffer, next: AtomicUsize::new(initial_next) };
+            let mut buf: CBuf<i16, 4> = CBuf { buf: initial_buffer, next: AtomicIndex::new(initial_next) };
             let mut writer = buf.as_writer();
 
             writer.add_item(item);
             assert_eq!(buf.buf, final_buffer);
-            assert_eq!(buf.next.load(SeqCst), final_next);
+            assert_eq!(buf.next.load(SeqCst).0.as_usize(), final_next & !(1usize << (usize::BITS - 1)));
         }
 
         run_cbuf_add_item(
@@ -508,9 +508,9 @@ mod tests {
         let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
 
         cbuf.buf = [-1, -2, -3, -4];
-        cbuf.next.store(0x16, SeqCst);
-        writer.next = 0x16;
-        reader.next = 0x12;
+        cbuf.next.store(BufIndex::new(0x16), false, SeqCst);
+        writer.next = BufIndex::new(0x16);
+        reader.next = BufIndex::new(0x12);
 
         let (ts_wr, chans_wr) = TestSequencer::new();
         let (ts_rd, chans_rd) = TestSequencer::new();
@@ -565,9 +565,9 @@ mod tests {
         let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
         let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
 
-        cbuf.next.store(0x2005, SeqCst);
-        writer.next = 0x2005;
-        reader.next = 0x1005;
+        cbuf.next.store(BufIndex::new(0x2005), false, SeqCst);
+        writer.next = BufIndex::new(0x2005);
+        reader.next = BufIndex::new(0x1005);
 
         let (ts_wr, chans_wr) = TestSequencer::new();
         let (ts_rd, chans_rd) = TestSequencer::new();
@@ -648,11 +648,11 @@ mod tests {
             let mut trace: Vec<TraceStep<T>> = Vec::with_capacity(chain.len());
 
             let buf_writer = CBufWriter {
-                next: cbuf.next.load(SeqCst),
+                next: cbuf.next.load(SeqCst).0,
                 cbuf: unsafe { &mut *cbuf_ptr },
             };
             let mut buf_reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-            buf_reader.next = initial_read_next;
+            buf_reader.next = BufIndex::new(initial_read_next);
 
             let (ts_wr, chans_wr) = TestSequencer::new();
             let (ts_rd, chans_rd) = TestSequencer::new();
@@ -796,7 +796,7 @@ mod tests {
             &|| {
                 CBuf {
                     buf: iota::<16>(),
-                    next: 0x14.into()
+                    next: AtomicIndex::new(0x14),
                 }
             },
             &|mut reader, sequencer| {
@@ -829,7 +829,7 @@ mod tests {
             &|| {
                 CBuf {
                     buf: iota::<16>(),
-                    next: 0x14.into(),
+                    next: AtomicIndex::new(0x14),
                 }
             },
             &|mut reader, sequencer| {
@@ -915,7 +915,7 @@ mod tests {
             &|| {
                 CBuf {
                     buf: iota::<16>(),
-                    next: 0x24.into(),
+                    next: AtomicIndex::new(0x24),
                 }
             },
             &|mut reader, sequencer| {
