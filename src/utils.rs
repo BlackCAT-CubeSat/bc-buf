@@ -21,6 +21,7 @@ impl<const SIZE: usize> BufIndex<SIZE> {
     const IS_SIZE_OK: bool = CBuf::<(), SIZE>::IS_SIZE_OK;
     const IDX_MASK: usize = CBuf::<(), SIZE>::IDX_MASK;
     const SCALED_SIZE: usize = SIZE << 1;
+    const MAX: usize = usize::MAX & !0b01;
 
     #[inline]
     pub const fn new(raw_val: usize) -> Self {
@@ -46,8 +47,20 @@ impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
     type Output = Self;
 
     #[inline]
-    fn add(self, rhs: usize) -> Self {
-        unimplemented!();
+    fn add(self, increment: usize) -> Self {
+        if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
+
+        let scaled_increment = increment << 1;
+        let (naive_sum, wrapped) = self.idx.overflowing_add(scaled_increment);
+
+        let final_sum = if !wrapped {
+            naive_sum
+        } else if naive_sum <= (Self::MAX - Self::SCALED_SIZE) {
+            naive_sum.wrapping_add(Self::SCALED_SIZE)
+        } else {
+            naive_sum.wrapping_add(Self::SCALED_SIZE.wrapping_mul(2))
+        };
+        Self { idx: final_sum }
     }
 }
 
@@ -55,14 +68,46 @@ impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
     type Output = Self;
 
     #[inline]
-    fn sub(self, rhs: usize) -> Self {
-        unimplemented!();
+    fn sub(self, decrement: usize) -> Self {
+        if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
+
+        let scaled_decrement = decrement << 1;
+
+        let result = if self.idx >= Self::SCALED_SIZE {
+            let (mut difference, wrapped) = self.idx.overflowing_sub(scaled_decrement);
+            if wrapped { difference = difference.wrapping_sub(Self::SCALED_SIZE); }
+            if difference < Self::SCALED_SIZE { difference = difference.wrapping_sub(Self::SCALED_SIZE); }
+            difference
+        } else {
+            self.idx.saturating_sub(scaled_decrement)
+        };
+        Self { idx: result }
     }
 }
 
 impl<const SIZE: usize> BufIndex<SIZE> {
-    pub const fn is_in_range(self, base: Self, len: usize) -> bool {
-        unimplemented!();
+    const LOOP_LENGTH: usize = ((Self::MAX >> 1) + 1) - SIZE;
+
+    #[inline]
+    pub fn is_in_range(self, base: Self, len: usize) -> bool {
+        if !Self::IS_SIZE_OK { return false; }
+
+        let (idx, base_, scaled_len) = (self.idx, base.idx, len.saturating_mul(2));
+
+        if base_ < Self::SCALED_SIZE {
+            let (end_idx, overflow) = base_.overflowing_add(scaled_len);
+            (base_ <= idx) && (overflow || (idx < end_idx))
+        } else if len >= Self::LOOP_LENGTH {
+            Self::SCALED_SIZE <= idx
+        } else {
+            let end_idx = (base + len).idx;
+
+            if end_idx >= base_ {
+                (base_ <= idx) && (idx < end_idx)
+            } else {
+                (base_ <= idx) || ((Self::SCALED_SIZE <= idx) && (idx < end_idx))
+            }
+        }
     }
 }
 
@@ -235,13 +280,18 @@ mod index_tests {
     impl UsizeExt for usize {}
 
     macro_rules! test_case {
+        (@ 16, $a:expr, $op:literal, $b:expr, $result:expr) => {
+            concat!("(<16>(", stringify!($a), ") ", $op, " (", stringify!($b), ") == ", stringify!($result), ")")
+        };
         (+, $a:expr, $b:expr, $result:expr) => {
             assert_eq!(($a as usize).add_index::<16>($b as usize), $result);
-            assert_eq!(BufIndex::<16>::new($a) + ($b as usize), BufIndex::<16>::new($result));
+            assert_eq!(BufIndex::<16>::new($a) + ($b as usize), BufIndex::<16>::new($result),
+                test_case!(@ 16, $a, "+", $b, $result));
         };
         (-, $a:expr, $b:expr, $result:expr) => {
             assert_eq!(($a as usize).sub_index::<16>($b as usize), $result);
-            assert_eq!(BufIndex::<16>::new($a) - ($b as usize), BufIndex::<16>::new($result));
+            assert_eq!(BufIndex::<16>::new($a) - ($b as usize), BufIndex::<16>::new($result),
+                test_case!(@ 16, $a, "-", $b, $result));
         };
     }
 
@@ -487,14 +537,23 @@ mod index_tests {
         test_case!(-, 30, M, M);
     }
 
+    fn trim_top_bit(x: usize) -> usize {
+        x & !(1 << (usize::BITS - 1))
+    }
+
     macro_rules! in_range_tableau {
+        (@ @ $a:expr, $b:expr, $c:expr, $result:expr) => {
+            concat!("<16>((", stringify!($a), ").in_range(", stringify!($b), ", ", stringify!($c), ") == ", stringify!($result), ")")
+        };
         (@ 0 $a:expr , $b:expr, $c:expr, T) => {
             assert!(($a as usize).in_range::<16>($b, $c) == true);
-            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == true);
+            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), trim_top_bit($c)) == true,
+                in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 0 $a:expr , $b:expr, $c:expr, F) => {
             assert!(($a as usize).in_range::<16>($b, $c) == false);
-            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == false);
+            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), trim_top_bit($c)) == false,
+                in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 1 $a:expr ; ( $( ($b:expr, $c:expr) ),* ) ; ( $( $d:ident ),* )) => {
             $( in_range_tableau!(@ 0 $a, $b, $c, $d); )*
