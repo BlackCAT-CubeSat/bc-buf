@@ -29,7 +29,7 @@ pub(crate) trait IndexMath: Copy {
 impl IndexMath for usize {
     #[inline]
     fn add_index<const SIZE: usize>(self, increment: usize) -> usize {
-        if !CBuf::<(), SIZE>::IS_POWER_OF_TWO { return 0; }
+        if !CBuf::<(), SIZE>::IS_SIZE_OK { return 0; }
 
         let (naive_sum, wrapped) = self.overflowing_add(increment);
 
@@ -44,7 +44,7 @@ impl IndexMath for usize {
 
     #[inline]
     fn sub_index<const SIZE: usize>(self, decrement: usize) -> usize {
-        if !CBuf::<(), SIZE>::IS_POWER_OF_TWO { return 0; }
+        if !CBuf::<(), SIZE>::IS_SIZE_OK { return 0; }
 
         if self >= SIZE {
             let (mut difference, wrapped) = self.overflowing_sub(decrement);

@@ -31,16 +31,17 @@ pub struct CBuf<T: CBufItem, const SIZE: usize> {
 }
 
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
-    /// If `SIZE` is a power of two, as it should be, this is just `true`;
+    /// If `SIZE` is a power of two that's greater than 1 and less than
+    /// 2<sup>[`NBITS`](usize::NBITS)`-1`</sup>, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
-    const IS_POWER_OF_TWO: bool = if SIZE.is_power_of_two() { true }
-    else { panic!("SIZE param of some CBuf is *not* a power of two") };
+    const IS_SIZE_OK: bool = if (SIZE.is_power_of_two() && SIZE < (usize::MAX >> 1) && SIZE > 1) { true }
+    else { panic!("SIZE param of some CBuf is *not* an allowed value") };
 
-    const IDX_MASK: usize = if Self::IS_POWER_OF_TWO { SIZE - 1 } else { 0 };
+    const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
 
     #[inline]
     pub fn new(filler_item: T) -> Self {
-        let initial_next: usize = if Self::IS_POWER_OF_TWO { 0 } else { 0 };
+        let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 0 };
 
         CBuf {
             buf: [filler_item; SIZE],
@@ -52,7 +53,7 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     pub unsafe fn initialize(p: *mut Self, filler_item: T) {
         use core::ptr::addr_of_mut;
 
-        if p.is_null() || !Self::IS_POWER_OF_TWO { return; }
+        if p.is_null() || !Self::IS_SIZE_OK { return; }
 
         for i in 0..SIZE {
             write_volatile(addr_of_mut!((*p).buf[i]), filler_item);
@@ -93,8 +94,11 @@ pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
 }
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
+    const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
+    const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
+
     pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, SIZE>) -> Option<Self> {
-        if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
+        if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
 
         cbuf.next.store(0, SeqCst);
@@ -119,15 +123,12 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
             };
         }
 
-        #[allow(non_snake_case)]
-        let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
-
         let next_next = self.next.next_index::<SIZE>();
 
         wrap_atomic! { 1, }
         wrap_atomic! { 2,
             fence(SeqCst);
-            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next & IDX_MASK]), item) };
+            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next & Self::IDX_MASK]), item) };
             fence(SeqCst);
         }
         wrap_atomic! { 3, self.cbuf.next.store(next_next, SeqCst); }
@@ -162,8 +163,11 @@ pub(crate) enum FetchCheckpoint<T> {
 }
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
+    const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
+    const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
+
     pub unsafe fn from_ptr(cbuf: *const CBuf<T, SIZE>) -> Option<Self> {
-        if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
+        if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
 
         Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst) })
@@ -200,9 +204,6 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             };
         }
 
-        #[allow(non_snake_case)]
-        let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
-
         let cbuf = self.cbuf;
         let mut skipped = false;
 
@@ -210,7 +211,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             let next_0 = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
             let item = wrap_atomic! { 2,
                 fence(SeqCst);
-                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & IDX_MASK])) };
+                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & Self::IDX_MASK])) };
                 fence(SeqCst);
                 item
             };
