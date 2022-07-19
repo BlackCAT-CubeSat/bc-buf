@@ -238,6 +238,11 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
                 self.next = next_1 - offset;
                 skipped = true;
             }
+
+            if is_writing_0 || is_writing_1 || (next_0 != next_1) {
+                // writer is active, let's possibly cool our jets:
+                core::hint::spin_loop();
+            }
         }
 
         send_and_return!(RR::SpinFail);
