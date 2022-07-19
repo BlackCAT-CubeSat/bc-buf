@@ -236,7 +236,12 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
 
             let next_next = self.next + 1;
-            let (idx_n, idx_0, idx_1) = (self.next.as_usize() & Self::IDX_MASK, next_0.as_usize() & Self::IDX_MASK, next_1.as_usize() & Self::IDX_MASK);
+            let (idx_n, idx_0, idx_1) = (
+                self.next.as_usize() & Self::IDX_MASK,
+                next_0.as_usize() & Self::IDX_MASK,
+                next_1.as_usize() & Self::IDX_MASK
+            );
+
             if next_0.is_in_range(next_next, SIZE) && next_1.is_in_range(next_next, SIZE)
                 && !(idx_0 == idx_n && is_writing_0) && !(idx_1 == idx_n && is_writing_1) {
                 self.next = next_next;
@@ -253,7 +258,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             }
 
             if is_writing_0 || is_writing_1 || (next_0 != next_1) {
-                // writer is active, let's possibly cool our jets:
+                // writer is active, let's give a hint to cool this thread's jets:
                 core::hint::spin_loop();
             }
         }
@@ -1006,10 +1011,15 @@ mod tests {
                     }
 
                     // if the last read sequence occurs entirely after the write sequence,
-                    // we should return Skipped(5)
+                    // we should return Skipped(5) or, if *right* after the write sequence,
+                    // possibly SpinFail
                     if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
                         if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                            assert_eq!(return_value, RR::Skipped(5));
+                            if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
+                                assert_let!(return_value, RR::Skipped(5) | RR::SpinFail);
+                            } else {
+                                assert_eq!(return_value, RR::Skipped(5));
+                            }
                         }
                     }
                 }
