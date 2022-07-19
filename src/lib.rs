@@ -125,7 +125,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
 
         let next_next = self.next + 1;
 
-        wrap_atomic! { 1, }
+        wrap_atomic! { 1, self.cbuf.next.store(self.next, true, SeqCst); }
         wrap_atomic! { 2,
             fence(SeqCst);
             unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next.as_usize() & Self::IDX_MASK]), item) };
@@ -208,25 +208,29 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let (next_0, _) = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
+            let (next_0, is_writing_0) = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
             let item = wrap_atomic! { 2,
                 fence(SeqCst);
                 let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next.as_usize() & Self::IDX_MASK])) };
                 fence(SeqCst);
                 item
             };
-            let (next_1, _) = wrap_atomic! { 3, cbuf.next.load(SeqCst) };
+            let (next_1, is_writing_1) = wrap_atomic! { 3, cbuf.next.load(SeqCst) };
+            #[cfg(test)]
+            std::eprintln!("next: {}   0: ({}, {})  1: ({}, {})", self.next.as_usize(), next_0.as_usize(), is_writing_0, next_1.as_usize(), is_writing_1);
 
             if next_1 == BufIndex::ZERO { send_and_return!(RR::None); }
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
 
-            let ok_next_01_base = self.next + 1;
-            if next_0.is_in_range(ok_next_01_base, SIZE) && next_1.is_in_range(ok_next_01_base, SIZE) {
-                self.next += 1;
+            let next_next = self.next + 1;
+            let (idx_n, idx_0, idx_1) = (self.next.as_usize() & Self::IDX_MASK, next_0.as_usize() & Self::IDX_MASK, next_1.as_usize() & Self::IDX_MASK);
+            if next_0.is_in_range(next_next, SIZE) && next_1.is_in_range(next_next, SIZE)
+                && !(idx_0 == idx_n && is_writing_0) && !(idx_1 == idx_n && is_writing_1) {
+                self.next = next_next;
                 send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
             }
 
-            if !(next_1.is_in_range(ok_next_01_base, SIZE)) {
+            if !(next_1.is_in_range(next_next, SIZE)) {
                 // we've gotten too far behind, and we've gotten wrapped by the writer,
                 // or else the circular buffer's been re-initialized;
                 // in either case, we need to play catch-up
@@ -942,24 +946,26 @@ mod tests {
 
                 for (i, t) in trace.iter().enumerate() {
                     // if we read from the buffer entry in a temporal interval
-                    // containing a write to that entry, make sure we read again afterward:
+                    // containing a write to that entry, make sure we read again afterward
+                    // (or call it quits with a return of SpinFail).
                     if *t == TS::Reader(FC::Step(2)) {
                         match prev_with_pat!(trace, i, TS::Writer(_)) {
                             Some(TS::Writer(1)) | Some(TS::Writer(2)) => {
-                                assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(2))).is_some());
+                                assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(2)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
                             }
                             _ => (),
                         }
                     }
 
                     // the last read should occur either before the write sequence starts
-                    // or after the write sequence ends.
+                    // or after the write sequence ends (or we return SpinFail).
                     if *t == TS::Reader(FC::Step(2)) && next_with_pat!(trace, i, TS::Reader(FC::Step(2))) == None {
                         let prev_write_step = prev_with_pat!(trace, i, TS::Writer(_));
                         let next_write_step = next_with_pat!(trace, i, TS::Writer(_));
 
                         assert!((prev_write_step == Some(TS::Writer(3)) && next_write_step == None)
-                             || (prev_write_step == None && next_write_step == Some(TS::Writer(1))),
+                             || (prev_write_step == None && next_write_step == Some(TS::Writer(1)))
+                             || (next_with_pat!(trace, i, TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some()),
                             "last read should be entirely before or entirely after write sequence");
                     }
                 }
