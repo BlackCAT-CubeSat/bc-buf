@@ -213,8 +213,9 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         }
         macro_rules! send_and_return {
             ($result:expr) => {
-                seq.send_result(FetchCheckpoint::ReturnVal($result));
-                return $result;
+                let x = $result;
+                seq.send_result(FetchCheckpoint::ReturnVal(x));
+                return x;
             };
         }
 
@@ -955,6 +956,7 @@ mod tests {
             &mut |trace| {
                 std::eprintln!("testing {:?}", trace);
 
+                // something should have happened
                 assert!(trace.len() > 0);
 
                 // there should be one return from fetch_next_item_seq() :)
@@ -962,6 +964,13 @@ mod tests {
                     trace.iter().filter(|t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
                     1
                 );
+
+                // return value should be one of Success(4), Skipped(5), and SpinFail
+                let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
+                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
+                    _ => unreachable!(),
+                };
+                assert_let!(return_value, RR::Success(4) | RR::Skipped(5) | RR::SpinFail);
 
                 for (i, t) in trace.iter().enumerate() {
                     // if we read from the buffer entry in a temporal interval
@@ -976,7 +985,7 @@ mod tests {
                         }
                     }
 
-                    // the last read should occur either before the write sequence starts
+                    // the last buffer read should occur either before the write sequence starts
                     // or after the write sequence ends (or we return SpinFail).
                     if *t == TS::Reader(FC::Step(RPS::BufferRead)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::BufferRead))).is_none() {
                         let prev_write_step = prev_with_pat!(trace, i, TS::Writer(_));
@@ -984,8 +993,24 @@ mod tests {
 
                         assert!((prev_write_step == Some(TS::Writer(WPS::IndexPostUpdate)) && next_write_step == None)
                              || (prev_write_step == None && next_write_step == Some(TS::Writer(WPS::IndexPreUpdate)))
-                             || next_with_pat!(trace, i, TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some(),
+                             || return_value == RR::SpinFail,
                             "last read should be entirely before or entirely after write sequence");
+                    }
+
+                    // if the last read sequence occurs entirely before the write sequence,
+                    // we should return Success(4)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
+                        if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            assert_eq!(return_value, RR::Success(4));
+                        }
+                    }
+
+                    // if the last read sequence occurs entirely after the write sequence,
+                    // we should return Skipped(5)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
+                        if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            assert_eq!(return_value, RR::Skipped(5));
+                        }
                     }
                 }
             }
