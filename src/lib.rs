@@ -213,6 +213,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         }
         macro_rules! send_and_return {
             ($result:expr) => {
+                seq.wait_for_go_ahead();
                 let x = $result;
                 seq.send_result(FetchCheckpoint::ReturnVal(x));
                 return x;
@@ -487,7 +488,8 @@ mod tests {
 
     macro_rules! expect_reader_ret {
         ($chan_pair:expr, $return_val:expr) => {
-            let (_, ref result) = &$chan_pair;
+            let (ref goahead, ref result) = &$chan_pair;
+            let _ = goahead.send(());
             assert_eq!(result.recv(), Ok(FetchCheckpoint::ReturnVal($return_val)));
         };
     }
