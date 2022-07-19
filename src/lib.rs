@@ -230,8 +230,6 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
                 item
             };
             let (next_1, is_writing_1) = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
-            #[cfg(test)]
-            std::eprintln!("next: {}   0: ({}, {})  1: ({}, {})", self.next.as_usize(), next_0.as_usize(), is_writing_0, next_1.as_usize(), is_writing_1);
 
             if next_1 == BufIndex::ZERO { send_and_return!(RR::None); }
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
