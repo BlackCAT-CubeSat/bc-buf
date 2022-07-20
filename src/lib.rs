@@ -138,7 +138,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
 
     pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a> where 'a: 'b {
         iter::CBufWriterIterator {
-            idx: self.next.as_usize().saturating_sub(SIZE),
+            idx: self.next - SIZE,
             writer: self,
         }
     }
