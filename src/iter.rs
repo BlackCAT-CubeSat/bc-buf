@@ -4,21 +4,22 @@
 //! Iterators related to circular buffers.
 
 use super::*;
+use crate::utils::BufIndex;
 
 pub(crate) struct CBufWriterIterator<'a, 'b, T: CBufItem, const SIZE: usize> where 'a: 'b {
     pub(crate) writer: &'b mut CBufWriter<'a, T, SIZE>,
-    pub(crate) idx: usize,
+    pub(crate) idx: BufIndex<SIZE>,
 }
 
 impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufWriterIterator<'a, 'b, T, SIZE> where 'a: 'b {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.writer.next.as_usize() { return None; }
+        if self.idx == self.writer.next { return None; }
 
         let old_idx = self.idx;
-        self.idx = old_idx.wrapping_add(1);
-        Some(self.writer.cbuf.buf[old_idx & CBuf::<T, SIZE>::IDX_MASK])
+        self.idx += 1;
+        Some(self.writer.cbuf.buf[old_idx.as_usize() & CBuf::<T, SIZE>::IDX_MASK])
     }
 }
 
