@@ -34,7 +34,7 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     /// If `SIZE` is a power of two that's greater than 1 and less than
     /// 2<sup>[`usize::BITS`]`-1`</sup>, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
-    const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE < (usize::MAX >> 1) && SIZE > 1 { true }
+    const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE > 1 { true }
     else { panic!("SIZE param of some CBuf is *not* an allowed value") };
 
     const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
@@ -65,7 +65,7 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     #[inline]
     pub fn as_writer<'a>(&'a mut self) -> CBufWriter<'a, T, SIZE> {
         CBufWriter {
-            next: self.next.load(SeqCst).0,
+            next: self.next.load(SeqCst),
             cbuf: self,
         }
     }
@@ -101,7 +101,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
 
-        cbuf.next.store(BufIndex::ZERO, false, SeqCst);
+        cbuf.next.store(BufIndex::ZERO, SeqCst);
 
         Some(CBufWriter { cbuf: cbuf, next: BufIndex::ZERO })
     }
@@ -125,20 +125,20 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
 
         let next_next = self.next + 1;
 
-        wrap_atomic! { IndexPreUpdate, self.cbuf.next.store(self.next, true, SeqCst); }
+        wrap_atomic! { PreWrite, }
         wrap_atomic! { BufferWrite,
             fence(SeqCst);
             unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next.as_usize() & Self::IDX_MASK]), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { IndexPostUpdate, self.cbuf.next.store(next_next, false, SeqCst); }
+        wrap_atomic! { IndexPostUpdate, self.cbuf.next.store(next_next, SeqCst); }
 
         self.next = next_next;
     }
 
     pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a> where 'a: 'b {
         iter::CBufWriterIterator {
-            idx: self.next - SIZE,
+            idx: self.next - (SIZE-1),
             writer: self,
         }
     }
@@ -146,7 +146,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WriteProtocolStep {
-    IndexPreUpdate,
+    PreWrite,
     BufferWrite,
     IndexPostUpdate,
 }
@@ -184,7 +184,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
 
-        Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst).0 })
+        Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst) })
     }
 
     const NUM_READ_TRIES: u32 = 16;
@@ -224,41 +224,35 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let (next_0, is_writing_0) = wrap_atomic! { IndexCheckPre, cbuf.next.load(SeqCst) };
+            let next_0 = wrap_atomic! { IndexCheckPre, cbuf.next.load(SeqCst) };
             let item = wrap_atomic! { BufferRead,
                 fence(SeqCst);
                 let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next.as_usize() & Self::IDX_MASK])) };
                 fence(SeqCst);
                 item
             };
-            let (next_1, is_writing_1) = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
+            let next_1 = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
+
+            let next_next = self.next + 1;
 
             if next_1 == BufIndex::ZERO { send_and_return!(RR::None); }
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
 
-            let next_next = self.next + 1;
-            let (idx_n, idx_0, idx_1) = (
-                self.next.as_usize() & Self::IDX_MASK,
-                next_0.as_usize() & Self::IDX_MASK,
-                next_1.as_usize() & Self::IDX_MASK
-            );
-
-            if next_0.is_in_range(next_next, SIZE) && next_1.is_in_range(next_next, SIZE)
-                && !(idx_0 == idx_n && is_writing_0) && !(idx_1 == idx_n && is_writing_1) {
+            if next_0.is_in_range(next_next, SIZE-1) && next_1.is_in_range(next_next, SIZE-1) {
                 self.next = next_next;
                 send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
             }
 
-            if !(next_1.is_in_range(next_next, SIZE)) {
+            if !(next_1.is_in_range(next_next, SIZE-1)) {
                 // we've gotten too far behind, and we've gotten wrapped by the writer,
                 // or else the circular buffer's been re-initialized;
                 // in either case, we need to play catch-up
-                let offset = if fast_forward { 1 } else { SIZE };
+                let offset = if fast_forward { 1 } else { SIZE-1 };
                 self.next = next_1 - offset;
                 skipped = true;
             }
 
-            if is_writing_0 || is_writing_1 || (next_0 != next_1) {
+            if next_0 != next_1 {
                 // writer is active, let's give a hint to cool this thread's jets:
                 core::hint::spin_loop();
             }

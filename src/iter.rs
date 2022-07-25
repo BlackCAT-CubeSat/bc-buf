@@ -75,7 +75,7 @@ mod iterator_tests {
 
         {
             let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
-            cbuf_reader.next = cbuf_reader.next - SIZE;
+            cbuf_reader.next = cbuf_reader.next - (SIZE-1);
             let mut reader_iter = cbuf_reader.available_items(false);
             for i in expected_results {
                 assert_eq!(reader_iter.next(), Some(ReadResult::Success(*i)));
@@ -92,22 +92,22 @@ mod iterator_tests {
         run_test(buf, 1, &[1]);
         run_test(buf, 2, &[1, 2]);
         run_test(buf, 3, &[1, 2, 3]);
-        run_test(buf, 4, &[1, 2, 3, 4]);
+        run_test(buf, 4, &[2, 3, 4]);
     }
 
     #[test]
     fn full_cbuf4() {
-        let buf = [-1i16, -2, -3, -4];
-        run_test(buf, 5, &[-2, -3, -4, -1]);
-        run_test(buf, 6, &[-3, -4, -1, -2]);
-        run_test(buf, 7, &[-4, -1, -2, -3]);
-        run_test(buf, 8, &[-1, -2, -3, -4]);
-        run_test(buf, 9, &[-2, -3, -4, -1]);
+        let buf = [-0i16, -1, -2, -3];
+        run_test(buf, 5, &[-2, -3, -0]);
+        run_test(buf, 6, &[-3, -0, -1]);
+        run_test(buf, 7, &[-0, -1, -2]);
+        run_test(buf, 8, &[-1, -2, -3]);
+        run_test(buf, 9, &[-2, -3, -0]);
 
-        run_test(buf, M4-1, &[-4, -1, -2, -3]);
-        run_test(buf, M4,   &[-1, -2, -3, -4]);
-        run_test(buf, M4+1, &[-2, -3, -4, -1]);
-        run_test(buf, M4+2, &[-3, -4, -1, -2]);
-        run_test(buf, M4+3, &[-4, -1, -2, -3]);
+        run_test(buf, M4-1, &[-0, -1, -2]);
+        run_test(buf, M4,   &[-1, -2, -3]);
+        run_test(buf, M4+1, &[-2, -3, -0]);
+        run_test(buf, M4+2, &[-3, -0, -1]);
+        run_test(buf, M4+3, &[-0, -1, -2]);
     }
 }
