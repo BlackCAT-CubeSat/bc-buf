@@ -13,7 +13,6 @@ use std::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BufIndex<const SIZE: usize> {
-    /// A [`usize`], pre-shifted so the low-order bit's available.
     idx: usize
 }
 
