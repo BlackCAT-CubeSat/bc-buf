@@ -19,21 +19,19 @@ pub struct BufIndex<const SIZE: usize> {
 
 impl<const SIZE: usize> BufIndex<SIZE> {
     const IS_SIZE_OK: bool = CBuf::<(), SIZE>::IS_SIZE_OK;
-    const SCALED_SIZE: usize = SIZE << 1;
-    const MAX: usize = usize::MAX & !0b01;
 
     #[inline]
     pub const fn new(raw_val: usize) -> Self {
         if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
 
-        Self { idx: raw_val << 1 }
+        Self { idx: raw_val }
     }
 
     pub const ZERO: Self = Self::new(0);
 
     #[inline]
     pub const fn as_usize(self) -> usize {
-        self.idx >> 1
+        self.idx
     }
 }
 
@@ -51,15 +49,14 @@ impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
     fn add(self, increment: usize) -> Self {
         if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
 
-        let scaled_increment = increment << 1;
-        let (naive_sum, wrapped) = self.idx.overflowing_add(scaled_increment);
+        let (naive_sum, wrapped) = self.idx.overflowing_add(increment);
 
         let final_sum = if !wrapped {
             naive_sum
-        } else if naive_sum <= (Self::MAX - Self::SCALED_SIZE) {
-            naive_sum.wrapping_add(Self::SCALED_SIZE)
+        } else if naive_sum <= (usize::MAX - SIZE) {
+            naive_sum.wrapping_add(SIZE)
         } else {
-            naive_sum.wrapping_add(Self::SCALED_SIZE.wrapping_mul(2))
+            naive_sum.wrapping_add(SIZE.wrapping_mul(2))
         };
         Self { idx: final_sum }
     }
@@ -79,15 +76,13 @@ impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
     fn sub(self, decrement: usize) -> Self {
         if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
 
-        let scaled_decrement = decrement << 1;
-
-        let result = if self.idx >= Self::SCALED_SIZE {
-            let (mut difference, wrapped) = self.idx.overflowing_sub(scaled_decrement);
-            if wrapped { difference = difference.wrapping_sub(Self::SCALED_SIZE); }
-            if difference < Self::SCALED_SIZE { difference = difference.wrapping_sub(Self::SCALED_SIZE); }
+        let result = if self.idx >= SIZE {
+            let (mut difference, wrapped) = self.idx.overflowing_sub(decrement);
+            if wrapped { difference = difference.wrapping_sub(SIZE); }
+            if difference < SIZE { difference = difference.wrapping_sub(SIZE); }
             difference
         } else {
-            self.idx.saturating_sub(scaled_decrement)
+            self.idx.saturating_sub(decrement)
         };
         Self { idx: result }
     }
@@ -101,26 +96,26 @@ impl<const SIZE: usize> SubAssign<usize> for BufIndex<SIZE> {
 }
 
 impl<const SIZE: usize> BufIndex<SIZE> {
-    const LOOP_LENGTH: usize = ((Self::MAX >> 1) + 1) - SIZE;
+    const LOOP_LENGTH: usize = usize::MAX - SIZE + 1;
 
     #[inline]
     pub fn is_in_range(self, base: Self, len: usize) -> bool {
         if !Self::IS_SIZE_OK { return false; }
 
-        let (idx, base_, scaled_len) = (self.idx, base.idx, len.saturating_mul(2));
+        let (idx, base_) = (self.idx, base.idx);
 
-        if base_ < Self::SCALED_SIZE {
-            let (end_idx, overflow) = base_.overflowing_add(scaled_len);
+        if base_ < SIZE {
+            let (end_idx, overflow) = base_.overflowing_add(len);
             (base_ <= idx) && (overflow || (idx < end_idx))
         } else if len >= Self::LOOP_LENGTH {
-            Self::SCALED_SIZE <= idx
+            SIZE <= idx
         } else {
-            let end_idx = (base + len).idx;
+            let end = (base + len).idx;
 
-            if end_idx >= base_ {
-                (base_ <= idx) && (idx < end_idx)
+            if end >= base_ {
+                (base_ <= idx) && (idx < end)
             } else {
-                (base_ <= idx) || ((Self::SCALED_SIZE <= idx) && (idx < end_idx))
+                (base_ <= idx) || ((SIZE <= idx) && (idx < end))
             }
         }
     }
@@ -131,28 +126,20 @@ pub(crate) struct AtomicIndex<const SIZE: usize> {
     n: AtomicUsize
 }
 
-const fn index_to_components<const SIZE: usize>(idx: usize) -> (BufIndex<SIZE>, bool) {
-    (BufIndex { idx: idx & !0b01  }, (idx & 0b01) != 0)
-}
-
-const fn components_to_index<const SIZE: usize>(idx: BufIndex<SIZE>, is_writing: bool) -> usize {
-    idx.idx | (is_writing as usize)
-}
-
-impl<const SIZE: usize> AtomicIndex<SIZE> {
+impl <const SIZE: usize> AtomicIndex<SIZE> {
     #[inline]
     pub(crate) const fn new(n: usize) -> Self {
-        Self { n: AtomicUsize::new(n << 1) }
+        Self { n: AtomicUsize::new(n) }
     }
 
     #[inline]
-    pub(crate) fn load(&self, order: Ordering) -> (BufIndex<SIZE>, bool) {
-        index_to_components(self.n.load(order))
+    pub(crate) fn load(&self, order: Ordering) -> BufIndex<SIZE> {
+        BufIndex { idx: self.n.load(order) }
     }
 
     #[inline]
-    pub(crate) fn store(&self, idx: BufIndex<SIZE>, is_writing: bool, order: Ordering) {
-        self.n.store(components_to_index(idx, is_writing), order);
+    pub(crate) fn store(&self, idx: BufIndex<SIZE>, order: Ordering) {
+        self.n.store(idx.idx, order);
     }
 }
 
@@ -477,11 +464,11 @@ mod index_tests {
             concat!("<16>((", stringify!($a), ").in_range(", stringify!($b), ", ", stringify!($c), ") == ", stringify!($result), ")")
         };
         (@ 0 $a:expr , $b:expr, $c:expr, T) => {
-            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), trim_top_bit($c)) == true,
+            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == true,
                 in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 0 $a:expr , $b:expr, $c:expr, F) => {
-            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), trim_top_bit($c)) == false,
+            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == false,
                 in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 1 $a:expr ; ( $( ($b:expr, $c:expr) ),* ) ; ( $( $d:ident ),* )) => {
