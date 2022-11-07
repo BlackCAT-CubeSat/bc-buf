@@ -1,11 +1,11 @@
 // Copyright (c) 2022 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! 
+//!
 
 use super::CBuf;
 
-use core::ops::{Add, Sub, AddAssign, SubAssign};
+use core::ops::{Add, AddAssign, Sub, SubAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -13,7 +13,7 @@ use std::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BufIndex<const SIZE: usize> {
-    idx: usize
+    idx: usize,
 }
 
 impl<const SIZE: usize> BufIndex<SIZE> {
@@ -21,7 +21,9 @@ impl<const SIZE: usize> BufIndex<SIZE> {
 
     #[inline]
     pub const fn new(raw_val: usize) -> Self {
-        if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
+        if !Self::IS_SIZE_OK {
+            return Self { idx: 0 };
+        }
 
         Self { idx: raw_val }
     }
@@ -46,7 +48,9 @@ impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
 
     #[inline]
     fn add(self, increment: usize) -> Self {
-        if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
+        if !Self::IS_SIZE_OK {
+            return Self { idx: 0 };
+        }
 
         let (naive_sum, wrapped) = self.idx.overflowing_add(increment);
 
@@ -73,12 +77,18 @@ impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
 
     #[inline]
     fn sub(self, decrement: usize) -> Self {
-        if !Self::IS_SIZE_OK { return Self { idx: 0 }; }
+        if !Self::IS_SIZE_OK {
+            return Self { idx: 0 };
+        }
 
         let result = if self.idx >= SIZE {
             let (mut difference, wrapped) = self.idx.overflowing_sub(decrement);
-            if wrapped { difference = difference.wrapping_sub(SIZE); }
-            if difference < SIZE { difference = difference.wrapping_sub(SIZE); }
+            if wrapped {
+                difference = difference.wrapping_sub(SIZE);
+            }
+            if difference < SIZE {
+                difference = difference.wrapping_sub(SIZE);
+            }
             difference
         } else {
             self.idx.saturating_sub(decrement)
@@ -99,7 +109,9 @@ impl<const SIZE: usize> BufIndex<SIZE> {
 
     #[inline]
     pub fn is_in_range(self, base: Self, len: usize) -> bool {
-        if !Self::IS_SIZE_OK { return false; }
+        if !Self::IS_SIZE_OK {
+            return false;
+        }
 
         let (idx, base_) = (self.idx, base.idx);
 
@@ -122,10 +134,10 @@ impl<const SIZE: usize> BufIndex<SIZE> {
 
 #[repr(transparent)]
 pub(crate) struct AtomicIndex<const SIZE: usize> {
-    n: AtomicUsize
+    n: AtomicUsize,
 }
 
-impl <const SIZE: usize> AtomicIndex<SIZE> {
+impl<const SIZE: usize> AtomicIndex<SIZE> {
     #[inline]
     pub(crate) const fn new(n: usize) -> Self {
         Self { n: AtomicUsize::new(n) }
@@ -161,7 +173,7 @@ impl<T: Send> Sequencer<T> for () {
 
 #[cfg(test)]
 pub(crate) struct TestSequencer<T: Send> {
-    rcv_chan: mpsc::Receiver<()>,
+    rcv_chan:  mpsc::Receiver<()>,
     send_chan: mpsc::Sender<T>,
 }
 
@@ -172,7 +184,10 @@ impl<T: Send> TestSequencer<T> {
         let (snd1, rcv1) = mpsc::channel::<T>();
 
         (
-            TestSequencer { rcv_chan: rcv0, send_chan: snd1 },
+            TestSequencer {
+                rcv_chan:  rcv0,
+                send_chan: snd1,
+            },
             (snd0, rcv1),
         )
     }
@@ -196,7 +211,6 @@ mod index_tests {
     use super::BufIndex;
 
     const M: usize = usize::MAX;
-
 
     macro_rules! test_case {
         (@ 16, $a:expr, $op:literal, $b:expr, $result:expr) => {

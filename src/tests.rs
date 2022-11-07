@@ -2,14 +2,14 @@
 
 #![cfg(test)]
 
-use super::*;
 use super::ReadResult as RR;
+use super::*;
+use crate::utils::TestSequencer;
 use core::mem::drop;
 use core::sync::atomic::Ordering::SeqCst;
 use std::panic;
-use std::thread::{spawn, JoinHandle};
 use std::sync::mpsc;
-use crate::utils::TestSequencer;
+use std::thread::{spawn, JoinHandle};
 use std::vec::Vec;
 
 #[test]
@@ -50,11 +50,16 @@ fn can_initialize_cbuf() {
 #[test]
 fn add_an_item() {
     fn run_cbuf_add_item(
-        initial_buffer: [i16; 4], initial_next: usize,
+        initial_buffer: [i16; 4],
+        initial_next: usize,
         item: i16,
-        final_buffer: [i16; 4], final_next: usize
+        final_buffer: [i16; 4],
+        final_next: usize,
     ) {
-        let mut buf: CBuf<i16, 4> = CBuf { buf: initial_buffer, next: AtomicIndex::new(initial_next) };
+        let mut buf: CBuf<i16, 4> = CBuf {
+            buf:  initial_buffer,
+            next: AtomicIndex::new(initial_next),
+        };
         let mut writer = buf.as_writer();
 
         writer.add_item(item);
@@ -62,59 +67,23 @@ fn add_an_item() {
         assert_eq!(buf.next.load(SeqCst).as_usize(), final_next);
     }
 
-    run_cbuf_add_item(
-        [-1, -2, -3, -4], 0,
-        99,
-        [99, -2, -3, -4], 1
-    );
+    run_cbuf_add_item([-1, -2, -3, -4], 0, 99, [99, -2, -3, -4], 1);
 
-    run_cbuf_add_item(
-        [99, -2, -3, -4], 1,
-        101,
-        [99, 101, -3, -4], 2
-    );
+    run_cbuf_add_item([99, -2, -3, -4], 1, 101, [99, 101, -3, -4], 2);
 
-    run_cbuf_add_item(
-        [-1, -2, -3, -4], 3,
-        99,
-        [-1, -2, -3, 99], 4
-    );
+    run_cbuf_add_item([-1, -2, -3, -4], 3, 99, [-1, -2, -3, 99], 4);
 
-    run_cbuf_add_item(
-        [-1, -2, -3, 99], 4,
-        101,
-        [101, -2, -3, 99], 5
-    );
+    run_cbuf_add_item([-1, -2, -3, 99], 4, 101, [101, -2, -3, 99], 5);
 
-    run_cbuf_add_item(
-        [-1, -2, -3, -4], 0x12,
-        99,
-        [-1, -2, 99, -4], 0x13
-    );
+    run_cbuf_add_item([-1, -2, -3, -4], 0x12, 99, [-1, -2, 99, -4], 0x13);
 
-    run_cbuf_add_item(
-        [-1, -2, 99, -4], 0x13,
-        101,
-        [-1, -2, 99, 101], 0x14
-    );
+    run_cbuf_add_item([-1, -2, 99, -4], 0x13, 101, [-1, -2, 99, 101], 0x14);
 
-    run_cbuf_add_item(
-        [-1, -2, 99, 101], 0x14,
-        202,
-        [202, -2, 99, 101], 0x15
-    );
+    run_cbuf_add_item([-1, -2, 99, 101], 0x14, 202, [202, -2, 99, 101], 0x15);
 
-    run_cbuf_add_item(
-        [-1, -2, -3, -4], usize::MAX - 1,
-        99,
-        [-1, -2, 99, -4], usize::MAX
-    );
+    run_cbuf_add_item([-1, -2, -3, -4], usize::MAX - 1, 99, [-1, -2, 99, -4], usize::MAX);
 
-    run_cbuf_add_item(
-        [-1, -2, 99, -4], usize::MAX,
-        101,
-        [-1, -2, 99, 101], 4
-    );
+    run_cbuf_add_item([-1, -2, 99, -4], usize::MAX, 101, [-1, -2, 99, 101], 4);
 }
 
 #[test]
@@ -176,11 +145,13 @@ macro_rules! assert_let {
         let val = $value;
         match val {
             $p => (),
-            _ => panic!(r"assertion failed: `left matches right`
+            _ => panic!(
+                r"assertion failed: `left matches right`
 left: `{:?}`
 right: `{}`",
-                val, stringify!($p)
-            )
+                val,
+                stringify!($p)
+            ),
         };
     };
 }
@@ -229,11 +200,17 @@ fn very_simple_multithreaded() {
         let _ = reader.fetch_next_item_seq(false, &ts_rd);
     });
 
-    for _ in 0..3 { step_reader!(chans_rd); }
+    for _ in 0..3 {
+        step_reader!(chans_rd);
+    }
     expect_reader_ret!(chans_rd, RR::None);
 
-    for _ in 0..3 { step_writer!(chans_wr); }
-    for _ in 0..3 { step_reader!(chans_rd); }
+    for _ in 0..3 {
+        step_writer!(chans_wr);
+    }
+    for _ in 0..3 {
+        step_reader!(chans_rd);
+    }
     expect_reader_ret!(chans_rd, RR::Success((1, 1)));
 
     for jh in [jh_wr, jh_rd] {
@@ -272,23 +249,37 @@ fn simple_interleaved_read_and_write() {
     });
 
     step_reader!(chans_rd);
-    for _ in 0..3 { step_writer!(chans_wr); }
+    for _ in 0..3 {
+        step_writer!(chans_wr);
+    }
     step_reader!(chans_rd);
     step_reader!(chans_rd);
-    for _ in 0..3 { step_reader!(chans_rd); }
+    for _ in 0..3 {
+        step_reader!(chans_rd);
+    }
     expect_reader_ret!(chans_rd, RR::Skipped(-4));
 
     step_reader!(chans_rd);
-    for _ in 0..(2*3) { step_writer!(chans_wr); }
+    for _ in 0..(2 * 3) {
+        step_writer!(chans_wr);
+    }
     step_reader!(chans_rd);
     step_reader!(chans_rd);
-    for _ in 0..3 { step_reader!(chans_rd); }
+    for _ in 0..3 {
+        step_reader!(chans_rd);
+    }
     expect_reader_ret!(chans_rd, RR::Skipped(44));
 
     step_reader!(chans_rd);
-    for _ in 0..3 { step_writer!(chans_wr); }
-    for _ in 0..2 { step_reader!(chans_rd); }
-    for _ in 0..3 { step_reader!(chans_rd); }
+    for _ in 0..3 {
+        step_writer!(chans_wr);
+    }
+    for _ in 0..2 {
+        step_reader!(chans_rd);
+    }
+    for _ in 0..3 {
+        step_reader!(chans_rd);
+    }
     expect_reader_ret!(chans_rd, RR::Success(45));
 
     for jh in [jh_wr, jh_rd] {
@@ -324,13 +315,15 @@ fn get_to_spinfail() {
         }),
         spawn(move || {
             reader.fetch_next_item_seq(false, &ts_rd);
-        })
+        }),
     ];
 
     for _ in 0..NUM_READ_TRIES {
         step_reader!(chans_rd);
 
-        for _ in 0..3 { step_writer!(chans_wr); }
+        for _ in 0..3 {
+            step_writer!(chans_wr);
+        }
 
         step_reader!(chans_rd);
         step_reader!(chans_rd);
@@ -355,13 +348,17 @@ fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
     read_thread_generator: &RD,
     initial_read_next: usize,
     write_thread_generator: &WR,
-    action: &mut A
-)
-where T: CBufItem,
-GEN: Fn() -> CBuf<T, SIZE>,
-RD: Fn(CBufReader<'static, T, SIZE>, TestSequencer<FetchCheckpoint<ReadResult<T>>>) -> JoinHandle<()>,
-WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<WriteProtocolStep>) -> JoinHandle<()>,
-A: FnMut(&[TraceStep<T>]) {
+    action: &mut A,
+) where
+    T: CBufItem,
+    GEN: Fn() -> CBuf<T, SIZE>,
+    RD: Fn(
+        CBufReader<'static, T, SIZE>,
+        TestSequencer<FetchCheckpoint<ReadResult<T>>>,
+    ) -> JoinHandle<()>,
+    WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<WriteProtocolStep>) -> JoinHandle<()>,
+    A: FnMut(&[TraceStep<T>]),
+{
     use std::boxed::Box;
 
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -372,9 +369,12 @@ A: FnMut(&[TraceStep<T>]) {
 
     type ChannelPair<X> = (mpsc::Sender<()>, mpsc::Receiver<X>);
 
-    struct RunningState<U, const SZ: usize> where U: CBufItem {
-        cbuf: Box<CBuf<U, SZ>>,
-        trace: Vec<TraceStep<U>>,
+    struct RunningState<U, const SZ: usize>
+    where
+        U: CBufItem,
+    {
+        cbuf:     Box<CBuf<U, SZ>>,
+        trace:    Vec<TraceStep<U>>,
         chans_wr: ChannelPair<WriteProtocolStep>,
         chans_rd: ChannelPair<FetchCheckpoint<ReadResult<U>>>,
         jhandles: [JoinHandle<()>; 2],
@@ -401,10 +401,8 @@ A: FnMut(&[TraceStep<T>]) {
         let (ts_wr, chans_wr) = TestSequencer::new();
         let (ts_rd, chans_rd) = TestSequencer::new();
 
-        let jhandles = [
-            write_thread_generator(buf_writer, ts_wr),
-            read_thread_generator(buf_reader, ts_rd),
-        ];
+        let jhandles =
+            [write_thread_generator(buf_writer, ts_wr), read_thread_generator(buf_reader, ts_rd)];
 
         for step in chain {
             match step {
@@ -412,112 +410,145 @@ A: FnMut(&[TraceStep<T>]) {
                     let (goahead, result) = &chans_rd;
                     let _ = goahead.send(());
                     match result.recv() {
-                        Ok(r) => { trace.push(TS::Reader(r)); }
-                        Err(e) => { panic!("Unexpected error `{:?}` during replay of event chain {:?}", e, chain); }
+                        Ok(r) => {
+                            trace.push(TS::Reader(r));
+                        }
+                        Err(e) => {
+                            panic!(
+                                "Unexpected error `{:?}` during replay of event chain {:?}",
+                                e, chain
+                            );
+                        }
                     }
                 }
                 ES::Writer => {
                     let (goahead, result) = &chans_wr;
                     let _ = goahead.send(());
                     match result.recv() {
-                        Ok(r) => { trace.push(TS::Writer(r)); }
-                        Err(e) => { panic!("Unexpected error `{:?}` during replay of event chain {:?}", e, chain); }
+                        Ok(r) => {
+                            trace.push(TS::Writer(r));
+                        }
+                        Err(e) => {
+                            panic!(
+                                "Unexpected error `{:?}` during replay of event chain {:?}",
+                                e, chain
+                            );
+                        }
                     }
                 }
             }
         }
 
-        RunningState { cbuf, trace, chans_wr, chans_rd, jhandles }
+        RunningState {
+            cbuf,
+            trace,
+            chans_wr,
+            chans_rd,
+            jhandles,
+        }
     };
 
     let root_state = replay_event_chain(&[]);
 
-    let mut recurse_over_event_chains = |
-        event_steps: Vec<EventStep>,
-        currently_running_state: RunningState<T, SIZE>
-    | {
-        // Helper function used to allow the logic of the closure to be recursive.
-        // Technique due to <https://stackoverflow.com/a/72862424>.
-        fn helper<REC, A, T, const SIZE: usize>(
-            event_steps: Vec<EventStep>,
-            currently_running_state: RunningState<T, SIZE>,
-            replay_event_chain: &mut REC,
-            action: &mut A
-        ) where
-        T: CBufItem,
-        REC: FnMut(&[EventStep]) -> RunningState<T, SIZE>,
-        A: FnMut(&[TraceStep<T>]) {
-            use EventStep as ES;
-            use TraceStep as TS;
+    let mut recurse_over_event_chains =
+        |event_steps: Vec<EventStep>, currently_running_state: RunningState<T, SIZE>| {
+            // Helper function used to allow the logic of the closure to be recursive.
+            // Technique due to <https://stackoverflow.com/a/72862424>.
+            fn helper<REC, A, T, const SIZE: usize>(
+                event_steps: Vec<EventStep>,
+                currently_running_state: RunningState<T, SIZE>,
+                replay_event_chain: &mut REC,
+                action: &mut A,
+            ) where
+                T: CBufItem,
+                REC: FnMut(&[EventStep]) -> RunningState<T, SIZE>,
+                A: FnMut(&[TraceStep<T>]),
+            {
+                use EventStep as ES;
+                use TraceStep as TS;
 
-            //std::eprintln!("recursing on {:?}", &event_steps[..]);
+                //std::eprintln!("recursing on {:?}", &event_steps[..]);
 
-            // Try another writer step.
-            let mut wr_events = event_steps.clone();
-            let mut wr_trace = currently_running_state.trace.clone();
+                // Try another writer step.
+                let mut wr_events = event_steps.clone();
+                let mut wr_trace = currently_running_state.trace.clone();
 
-            let (goahead, result) = &currently_running_state.chans_wr;
-            let _ = goahead.send(());
-            match result.recv() {
-                Err(_) => {
-                    // The writer thread has finished; run the reader to completion.
-                    let (goahead, result) = &currently_running_state.chans_rd;
-                    while let Ok(val) = { let _ = goahead.send(()); result.recv() } {
-                        wr_trace.push(TS::Reader(val));
+                let (goahead, result) = &currently_running_state.chans_wr;
+                let _ = goahead.send(());
+                match result.recv() {
+                    Err(_) => {
+                        // The writer thread has finished; run the reader to completion.
+                        let (goahead, result) = &currently_running_state.chans_rd;
+                        while let Ok(val) = {
+                            let _ = goahead.send(());
+                            result.recv()
+                        } {
+                            wr_trace.push(TS::Reader(val));
+                        }
+                        for jh in currently_running_state.jhandles {
+                            let _ = jh.join();
+                        }
+                        drop(currently_running_state.cbuf);
+                        //std::eprintln!("applying action on trace {:?}", &wr_events[..]);
+                        action(&wr_trace);
+
+                        // "Try another reader step" below would just
+                        // repeat this sequence of events, so there's
+                        // no need to run it.
+                        return;
                     }
-                    for jh in currently_running_state.jhandles {
-                        let _ = jh.join();
+                    Ok(val) => {
+                        wr_trace.push(TS::Writer(val));
+                        wr_events.push(ES::Writer);
+                        helper(
+                            wr_events,
+                            RunningState {
+                                trace: wr_trace,
+                                ..currently_running_state
+                            },
+                            replay_event_chain,
+                            action,
+                        );
                     }
-                    drop(currently_running_state.cbuf);
-                    //std::eprintln!("applying action on trace {:?}", &wr_events[..]);
-                    action(&wr_trace);
-
-                    // "Try another reader step" below would just
-                    // repeat this sequence of events, so there's
-                    // no need to run it.
-                    return;
                 }
-                Ok(val) => {
-                    wr_trace.push(TS::Writer(val));
-                    wr_events.push(ES::Writer);
-                    helper(wr_events, RunningState { trace: wr_trace, ..currently_running_state }, replay_event_chain, action);
+
+                // Try another reader step.
+                // We consumed the passed-in threads in "try another writer step",
+                // so we need to recreate them first.
+                let mut reader_state = replay_event_chain(&event_steps);
+                let mut reader_events = event_steps.clone();
+
+                let (goahead, result) = &reader_state.chans_rd;
+                let _ = goahead.send(());
+                match result.recv() {
+                    Err(_) => {
+                        // The reader thread has finished. Wind up execution.
+                        let (goahead, result) = &reader_state.chans_wr;
+                        while let Ok(_) = {
+                            let _ = goahead.send(());
+                            result.recv()
+                        } {}
+                        for jh in reader_state.jhandles {
+                            let _ = jh.join();
+                        }
+                        drop(reader_state.cbuf);
+
+                        // If the situation was symmetrical between reader and writer,
+                        // we'd now call action()... but we've already done that with
+                        // this particular sequence of events in the recursion in
+                        // "try another writer step" above, so we'd just be repeating
+                        // that sequence.
+                        return;
+                    }
+                    Ok(val) => {
+                        reader_state.trace.push(TS::Reader(val));
+                        reader_events.push(ES::Reader);
+                        helper(reader_events, reader_state, replay_event_chain, action);
+                    }
                 }
             }
-
-            // Try another reader step.
-            // We consumed the passed-in threads in "try another writer step",
-            // so we need to recreate them first.
-            let mut reader_state = replay_event_chain(&event_steps);
-            let mut reader_events = event_steps.clone();
-
-            let (goahead, result) = &reader_state.chans_rd;
-            let _ = goahead.send(());
-            match result.recv() {
-                Err(_) => {
-                    // The reader thread has finished. Wind up execution.
-                    let (goahead, result) = &reader_state.chans_wr;
-                    while let Ok(_) = { let _ = goahead.send(()); result.recv() } {}
-                    for jh in reader_state.jhandles {
-                        let _ = jh.join();
-                    }
-                    drop(reader_state.cbuf);
-
-                    // If the situation was symmetrical between reader and writer,
-                    // we'd now call action()... but we've already done that with
-                    // this particular sequence of events in the recursion in
-                    // "try another writer step" above, so we'd just be repeating
-                    // that sequence.
-                    return;
-                }
-                Ok(val) => {
-                    reader_state.trace.push(TS::Reader(val));
-                    reader_events.push(ES::Reader);
-                    helper(reader_events, reader_state, replay_event_chain, action);
-                }
-            }
-        }
-        helper(event_steps, currently_running_state, &mut replay_event_chain, action);
-    };
+            helper(event_steps, currently_running_state, &mut replay_event_chain, action);
+        };
 
     recurse_over_event_chains(Vec::new(), root_state);
 }
@@ -537,11 +568,9 @@ const fn iota<const SIZE: usize>() -> [u32; SIZE] {
 fn mini_model_example() {
     let mut i = 0usize;
     iterate_over_event_sequences(
-        &|| {
-            CBuf {
-                buf: iota::<16>(),
-                next: AtomicIndex::new(0x14),
-            }
+        &|| CBuf {
+            buf:  iota::<16>(),
+            next: AtomicIndex::new(0x14),
         },
         &|mut reader, sequencer| {
             spawn(move || {
@@ -558,7 +587,7 @@ fn mini_model_example() {
             std::eprintln!("{}: {:?}", i, trace);
             i += 1;
             assert!(trace.len() > 0);
-        }
+        },
     );
     //panic!("panicking just so we can see the list of all traces");
 }
@@ -566,15 +595,13 @@ fn mini_model_example() {
 /// A test case with one write and one read where neither should interfere with each other.
 #[test]
 fn mini_model_no_interference_1w1r() {
-    use TraceStep as TS;
     use FetchCheckpoint as FC;
+    use TraceStep as TS;
 
     iterate_over_event_sequences(
-        &|| {
-            CBuf {
-                buf: iota::<16>(),
-                next: AtomicIndex::new(0x14),
-            }
+        &|| CBuf {
+            buf:  iota::<16>(),
+            next: AtomicIndex::new(0x14),
         },
         &|mut reader, sequencer| {
             spawn(move || {
@@ -602,21 +629,33 @@ fn mini_model_no_interference_1w1r() {
                     assert_eq!(val, ReadResult::Success(1));
                 }
             }
-        }
+        },
     );
 }
 
 trait SliceExt {
     type Item;
 
-    fn prev_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item>;
-    fn next_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item>;
+    fn prev_with<F: Fn(&Self::Item) -> bool>(
+        &self,
+        index: usize,
+        predicate: F,
+    ) -> Option<Self::Item>;
+    fn next_with<F: Fn(&Self::Item) -> bool>(
+        &self,
+        index: usize,
+        predicate: F,
+    ) -> Option<Self::Item>;
 }
 
 impl<T: Clone> SliceExt for [T] {
     type Item = T;
 
-    fn prev_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item> {
+    fn prev_with<F: Fn(&Self::Item) -> bool>(
+        &self,
+        index: usize,
+        predicate: F,
+    ) -> Option<Self::Item> {
         let mut i = index;
         while i > 0 {
             i -= 1;
@@ -627,8 +666,12 @@ impl<T: Clone> SliceExt for [T] {
         None
     }
 
-    fn next_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item> {
-        for i in &self[(index+1)..] {
+    fn next_with<F: Fn(&Self::Item) -> bool>(
+        &self,
+        index: usize,
+        predicate: F,
+    ) -> Option<Self::Item> {
+        for i in &self[(index + 1)..] {
             if predicate(i) {
                 return Some(i.clone());
             }
@@ -640,29 +683,27 @@ impl<T: Clone> SliceExt for [T] {
 macro_rules! prev_with_pat {
     ($array:expr, $index:expr, $pattern:pat) => {
         $array.prev_with($index, |ref item| matches!(item, $pattern))
-    }
+    };
 }
 
 macro_rules! next_with_pat {
     ($array:expr, $index:expr, $pattern:pat) => {
         $array.next_with($index, |ref item| matches!(item, $pattern))
-    }
+    };
 }
 
 /// A test case with one write and one read where interference is possible in some cases.
 #[test]
 fn mini_model_interference_1w1r_no_ff() {
-    use TraceStep as TS;
     use FetchCheckpoint as FC;
     use ReadProtocolStep as RPS;
+    use TraceStep as TS;
     use WriteProtocolStep as WPS;
 
     iterate_over_event_sequences(
-        &|| {
-            CBuf {
-                buf: iota::<16>(),
-                next: AtomicIndex::new(0x23),
-            }
+        &|| CBuf {
+            buf:  iota::<16>(),
+            next: AtomicIndex::new(0x23),
         },
         &|mut reader, sequencer| {
             spawn(move || {
@@ -688,10 +729,11 @@ fn mini_model_interference_1w1r_no_ff() {
             );
 
             // return value should be one of Success(4), Skipped(5), and SpinFail
-            let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
-                Some(TS::Reader(FC::ReturnVal(rval))) => rval,
-                _ => unreachable!(),
-            };
+            let return_value =
+                match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
+                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
+                    _ => unreachable!(),
+                };
             assert_let!(return_value, RR::Success(4) | RR::Skipped(5) | RR::SpinFail);
 
             for (i, t) in trace.iter().enumerate() {
@@ -704,21 +746,33 @@ fn mini_model_interference_1w1r_no_ff() {
                         while j > 0 {
                             j -= 1;
                             match trace[j] {
-                                TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
-                                TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
+                                TS::Reader(FC::Step(RPS::IndexCheckPre)) => {
+                                    break 'x false;
+                                }
+                                TS::Writer(WPS::IndexPostUpdate) => {
+                                    break 'x true;
+                                }
                                 _ => {}
                             }
                         }
                         panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
                     };
                     if interleaved_postupdate {
-                        assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
+                        assert!(next_with_pat!(
+                            trace,
+                            i,
+                            TS::Reader(FC::Step(RPS::IndexCheckPre))
+                                | TS::Reader(FC::ReturnVal(RR::SpinFail))
+                        )
+                        .is_some());
                     }
                 }
 
                 // if the last read sequence occurs entirely before the write sequence,
                 // we should return Success(4)
-                if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
+                if *t == TS::Reader(FC::Step(RPS::IndexCheckPost))
+                    && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none()
+                {
                     if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
                         assert_eq!(return_value, RR::Success(4));
                     }
@@ -727,9 +781,11 @@ fn mini_model_interference_1w1r_no_ff() {
                 // if the last read sequence occurs entirely after the write sequence,
                 // we should return Skipped(5) or, if *right* after the write sequence,
                 // possibly SpinFail
-                if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
+                if *t == TS::Reader(FC::Step(RPS::IndexCheckPre))
+                    && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none()
+                {
                     if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                        if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
+                        if i >= 1 && matches!(trace[i - 1], TS::Writer(_)) {
                             assert_let!(return_value, RR::Skipped(5) | RR::SpinFail);
                         } else {
                             assert_eq!(return_value, RR::Skipped(5));
@@ -737,23 +793,21 @@ fn mini_model_interference_1w1r_no_ff() {
                     }
                 }
             }
-        }
+        },
     );
 }
 
 #[test]
 fn mini_model_interference_1w1r_ff() {
-    use TraceStep as TS;
     use FetchCheckpoint as FC;
     use ReadProtocolStep as RPS;
+    use TraceStep as TS;
     use WriteProtocolStep as WPS;
 
     iterate_over_event_sequences(
-        &|| {
-            CBuf {
-                buf: iota::<16>(),
-                next: AtomicIndex::new(0x23),
-            }
+        &|| CBuf {
+            buf:  iota::<16>(),
+            next: AtomicIndex::new(0x23),
         },
         &|mut reader, sequencer| {
             spawn(move || {
@@ -779,10 +833,11 @@ fn mini_model_interference_1w1r_ff() {
             );
 
             // return value of fetch should be one of Success(4), Skipped(42), and SpinFail
-            let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
-                Some(TS::Reader(FC::ReturnVal(rval))) => rval,
-                _ => unreachable!(),
-            };
+            let return_value =
+                match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
+                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
+                    _ => unreachable!(),
+                };
             assert_let!(return_value, RR::Success(4) | RR::Skipped(42) | RR::SpinFail);
 
             for (i, t) in trace.iter().enumerate() {
@@ -795,21 +850,33 @@ fn mini_model_interference_1w1r_ff() {
                         while j > 0 {
                             j -= 1;
                             match trace[j] {
-                                TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
-                                TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
+                                TS::Reader(FC::Step(RPS::IndexCheckPre)) => {
+                                    break 'x false;
+                                }
+                                TS::Writer(WPS::IndexPostUpdate) => {
+                                    break 'x true;
+                                }
                                 _ => {}
                             }
                         }
                         panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
                     };
                     if interleaved_postupdate {
-                        assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
+                        assert!(next_with_pat!(
+                            trace,
+                            i,
+                            TS::Reader(FC::Step(RPS::IndexCheckPre))
+                                | TS::Reader(FC::ReturnVal(RR::SpinFail))
+                        )
+                        .is_some());
                     }
                 }
 
                 // if the last read sequence occurs entirely before the write sequence,
                 // we should return Success(4)
-                if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
+                if *t == TS::Reader(FC::Step(RPS::IndexCheckPost))
+                    && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none()
+                {
                     if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
                         assert_eq!(return_value, RR::Success(4));
                     }
@@ -818,9 +885,11 @@ fn mini_model_interference_1w1r_ff() {
                 // if the last read sequence occurs entirely after the write sequence,
                 // we should return Skipped(42), or, if *right* after the write sequence,
                 // possibly SpinFail
-                if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
+                if *t == TS::Reader(FC::Step(RPS::IndexCheckPre))
+                    && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none()
+                {
                     if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                        if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
+                        if i >= 1 && matches!(trace[i - 1], TS::Writer(_)) {
                             assert_let!(return_value, RR::Skipped(42) | RR::SpinFail);
                         } else {
                             assert_let!(return_value, RR::Skipped(42));
@@ -828,7 +897,7 @@ fn mini_model_interference_1w1r_ff() {
                     }
                 }
             }
-        }
+        },
     );
 
     //std::panic!("HA! HA! I'm using the Internet!!1");
