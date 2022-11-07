@@ -1,7 +1,8 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors
+// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Nonblocking single-writer, multiple-reader circular buffers
+//! Nonblocking single-writer, multiple-reader,
+//! zero-or-one-allocation circular buffers
 //! for sharing data across threads and processes
 //! (with possible misses by readers).
 
@@ -13,9 +14,9 @@ extern crate std;
 pub(crate) mod utils;
 pub(crate) mod iter;
 
-use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
+use core::sync::atomic::{fence, Ordering::SeqCst};
 use core::ptr::{read_volatile, write_volatile};
-use crate::utils::{IndexMath, Sequencer};
+use crate::utils::{BufIndex, Sequencer, AtomicIndex};
 
 /// A convenience trait for possible items
 /// read from and written to a circular buffer.
@@ -27,24 +28,25 @@ impl<T> CBufItem for T where T: Sized + Copy + Send + 'static {}
 #[repr(C)]
 pub struct CBuf<T: CBufItem, const SIZE: usize> {
     buf: [T; SIZE],
-    next: AtomicUsize,
+    next: AtomicIndex<SIZE>,
 }
 
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
-    /// If `SIZE` is a power of two, as it should be, this is just `true`;
+    /// If `SIZE` is a power of two that's greater than 1 and less than
+    /// 2<sup>[`usize::BITS`]`-1`</sup>, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
-    const IS_POWER_OF_TWO: bool = if SIZE.is_power_of_two() { true }
-    else { panic!("SIZE param of some CBuf is *not* a power of two") };
+    const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE > 1 { true }
+    else { panic!("SIZE param of some CBuf is *not* an allowed value") };
 
-    const IDX_MASK: usize = if Self::IS_POWER_OF_TWO { SIZE - 1 } else { 0 };
+    const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
 
     #[inline]
     pub fn new(filler_item: T) -> Self {
-        let initial_next: usize = if Self::IS_POWER_OF_TWO { 0 } else { 0 };
+        let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 1 };
 
         CBuf {
             buf: [filler_item; SIZE],
-            next: AtomicUsize::new(initial_next),
+            next: AtomicIndex::new(initial_next),
         }
     }
 
@@ -52,12 +54,12 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     pub unsafe fn initialize(p: *mut Self, filler_item: T) {
         use core::ptr::addr_of_mut;
 
-        if p.is_null() || !Self::IS_POWER_OF_TWO { return; }
+        if p.is_null() || !Self::IS_SIZE_OK { return; }
 
         for i in 0..SIZE {
             write_volatile(addr_of_mut!((*p).buf[i]), filler_item);
         }
-        write_volatile(addr_of_mut!((*p).next), AtomicUsize::new(0));
+        write_volatile(addr_of_mut!((*p).next), AtomicIndex::new(0));
         fence(SeqCst);
     }
 
@@ -84,22 +86,25 @@ impl<T: CBufItem + Default, const SIZE: usize> CBuf<T, SIZE> {
 
 pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
     cbuf: &'a mut CBuf<T, SIZE>,
-    next: usize,
+    next: BufIndex<SIZE>,
 }
 
 pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
     cbuf: &'a CBuf<T, SIZE>,
-    next: usize,
+    next: BufIndex<SIZE>,
 }
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
+    const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
+    const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
+
     pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, SIZE>) -> Option<Self> {
-        if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
+        if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
 
-        cbuf.next.store(0, SeqCst);
+        cbuf.next.store(BufIndex::ZERO, SeqCst);
 
-        Some(CBufWriter { cbuf: cbuf, next: 0 })
+        Some(CBufWriter { cbuf: cbuf, next: BufIndex::ZERO })
     }
 
     #[inline(always)]
@@ -108,39 +113,43 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     }
 
     #[inline]
-    pub(crate) fn add_item_seq<S: Sequencer<u32>>(&mut self, item: T, seq: &S) {
+    pub(crate) fn add_item_seq<S: Sequencer<WriteProtocolStep>>(&mut self, item: T, seq: &S) {
         use core::ptr::addr_of_mut;
 
         macro_rules! wrap_atomic {
-            ($label:expr, $($x:tt)*) => {
+            ($label:ident, $($x:tt)*) => {
                 seq.wait_for_go_ahead();
                 { $($x)* }
-                seq.send_result($label);
+                seq.send_result(WriteProtocolStep::$label);
             };
         }
 
-        #[allow(non_snake_case)]
-        let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
+        let next_next = self.next + 1;
 
-        let next_next = self.next.next_index::<SIZE>();
-
-        wrap_atomic! { 1, }
-        wrap_atomic! { 2,
+        wrap_atomic! { PreWrite, }
+        wrap_atomic! { BufferWrite,
             fence(SeqCst);
-            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next & IDX_MASK]), item) };
+            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next.as_usize() & Self::IDX_MASK]), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { 3, self.cbuf.next.store(next_next, SeqCst); }
+        wrap_atomic! { IndexPostUpdate, self.cbuf.next.store(next_next, SeqCst); }
 
         self.next = next_next;
     }
 
     pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a> where 'a: 'b {
         iter::CBufWriterIterator {
-            idx: self.next.saturating_sub(SIZE),
+            idx: self.next - (SIZE-1),
             writer: self,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteProtocolStep {
+    PreWrite,
+    BufferWrite,
+    IndexPostUpdate,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -155,15 +164,25 @@ pub enum ReadResult<T> {
     SpinFail,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReadProtocolStep {
+    IndexCheckPre,
+    BufferRead,
+    IndexCheckPost,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum FetchCheckpoint<T> {
-    Step(u32),
+    Step(ReadProtocolStep),
     ReturnVal(T),
 }
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
+    const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
+    const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
+
     pub unsafe fn from_ptr(cbuf: *const CBuf<T, SIZE>) -> Option<Self> {
-        if !CBuf::<T, SIZE>::IS_POWER_OF_TWO { return None; }
+        if !Self::IS_SIZE_OK { return None; }
         let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
 
         Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst) })
@@ -184,54 +203,61 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         use ReadResult as RR;
 
         macro_rules! wrap_atomic {
-            ($label:expr, $($x:tt)*) => {
+            ($label:ident, $($x:tt)*) => {
                 {
                     seq.wait_for_go_ahead();
                     let x = { $($x)* };
-                    seq.send_result(FetchCheckpoint::Step($label));
+                    seq.send_result(FetchCheckpoint::Step(ReadProtocolStep::$label));
                     x
                 }
             };
         }
         macro_rules! send_and_return {
             ($result:expr) => {
-                seq.send_result(FetchCheckpoint::ReturnVal($result));
-                return $result;
+                seq.wait_for_go_ahead();
+                let x = $result;
+                seq.send_result(FetchCheckpoint::ReturnVal(x));
+                return x;
             };
         }
-
-        #[allow(non_snake_case)]
-        let IDX_MASK = CBuf::<T, SIZE>::IDX_MASK;
 
         let cbuf = self.cbuf;
         let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let next_0 = wrap_atomic! { 1, cbuf.next.load(SeqCst) };
-            let item = wrap_atomic! { 2,
+            let next_0 = wrap_atomic! { IndexCheckPre, cbuf.next.load(SeqCst) };
+            let item = wrap_atomic! { BufferRead,
                 fence(SeqCst);
-                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next & IDX_MASK])) };
+                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next.as_usize() & Self::IDX_MASK])) };
                 fence(SeqCst);
                 item
             };
-            let next_1 = wrap_atomic! { 3, cbuf.next.load(SeqCst) };
+            let next_1 = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
+            #[cfg(test)]
+            std::eprintln!("next: 0x{:02x}    0: 0x{:02x}    1: 0x{:02x}", self.next.as_usize(), next_0.as_usize(), next_1.as_usize());
 
-            if next_1 == 0 { send_and_return!(RR::None); }
+            let next_next = self.next + 1;
+
+            if next_1 == BufIndex::ZERO { send_and_return!(RR::None); }
             if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
 
-            let ok_next_01_base = self.next.next_index::<SIZE>();
-            if next_0.in_range::<SIZE>(ok_next_01_base, SIZE) && next_1.in_range::<SIZE>(ok_next_01_base, SIZE) {
-                self.next.incr_index::<SIZE>();
+            if next_0.is_in_range(next_next, SIZE-1) && next_1.is_in_range(next_next, SIZE-1) {
+                self.next = next_next;
                 send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
             }
 
-            if !(next_1.in_range::<SIZE>(ok_next_01_base, SIZE)) {
+            if !(next_1.is_in_range(next_next, SIZE-1)) {
                 // we've gotten too far behind, and we've gotten wrapped by the writer,
                 // or else the circular buffer's been re-initialized;
                 // in either case, we need to play catch-up
-                let offset = if fast_forward { 1 } else { SIZE };
-                self.next = next_1.sub_index::<SIZE>(offset);
+                let offset = if fast_forward { 1 } else { SIZE-1 };
+                self.next = next_1 - offset;
                 skipped = true;
+            }
+
+            if next_0 != next_1 {
+                // writer is active, let's give a hint to cool this thread's jets:
+                core::hint::spin_loop();
             }
         }
 
@@ -262,7 +288,8 @@ mod tests {
     use super::*;
     use super::ReadResult as RR;
     use core::mem::drop;
-    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use core::sync::atomic::Ordering::SeqCst;
+    use std::panic;
     use std::thread::{spawn, JoinHandle};
     use std::sync::mpsc;
     use crate::utils::TestSequencer;
@@ -272,7 +299,7 @@ mod tests {
     fn can_construct_cbuf() {
         let a: CBuf<u32, 256> = CBuf::new(42);
 
-        assert_eq!(a.next.load(SeqCst), 0usize);
+        assert_eq!(a.next.load(SeqCst).as_usize(), 0usize);
         assert_eq!(a.buf.len(), 256);
         assert!(a.buf.iter().all(|x| *x == 42u32));
 
@@ -284,7 +311,7 @@ mod tests {
 
         let e: CBuf<isize, 128> = CBuf::new_with_default();
 
-        assert_eq!(e.next.load(SeqCst), 0usize);
+        assert_eq!(e.next.load(SeqCst).as_usize(), 0usize);
         assert_eq!(e.buf.len(), 128);
         assert!(e.buf.iter().all(|x| *x == <isize as Default>::default()));
     }
@@ -299,7 +326,7 @@ mod tests {
             un_cb.assume_init()
         };
 
-        assert_eq!(cb.next.load(SeqCst), 0usize);
+        assert_eq!(cb.next.load(SeqCst).as_usize(), 0usize);
         assert!(cb.buf.iter().all(|x| *x == 1729));
     }
 
@@ -310,12 +337,12 @@ mod tests {
             item: i16,
             final_buffer: [i16; 4], final_next: usize
         ) {
-            let mut buf: CBuf<i16, 4> = CBuf { buf: initial_buffer, next: AtomicUsize::new(initial_next) };
+            let mut buf: CBuf<i16, 4> = CBuf { buf: initial_buffer, next: AtomicIndex::new(initial_next) };
             let mut writer = buf.as_writer();
 
             writer.add_item(item);
             assert_eq!(buf.buf, final_buffer);
-            assert_eq!(buf.next.load(SeqCst), final_next);
+            assert_eq!(buf.next.load(SeqCst).as_usize(), final_next);
         }
 
         run_cbuf_add_item(
@@ -404,20 +431,20 @@ mod tests {
             assert_eq!(reader1.fetch_next_item(false), RR::Success(99));
         }
 
-        for i in 100..116 {
+        for i in 100..115 {
             writer.add_item(i);
             assert_eq!(reader1.fetch_next_item(false), RR::Success(i));
         }
 
         assert_eq!(reader2.fetch_next_item(false), RR::Skipped(100));
-        for i in 101..116 {
+        for i in 101..115 {
             assert_eq!(reader2.fetch_next_item(false), RR::Success(i));
         }
 
-        for i in 200..216 {
+        for i in 200..215 {
             writer.add_item(i);
         }
-        for i in 200..216 {
+        for i in 200..215 {
             assert_eq!(reader1.fetch_next_item(false), RR::Success(i));
         }
 
@@ -459,7 +486,8 @@ mod tests {
 
     macro_rules! expect_reader_ret {
         ($chan_pair:expr, $return_val:expr) => {
-            let (_, ref result) = &$chan_pair;
+            let (ref goahead, ref result) = &$chan_pair;
+            let _ = goahead.send(());
             assert_eq!(result.recv(), Ok(FetchCheckpoint::ReturnVal($return_val)));
         };
     }
@@ -500,16 +528,16 @@ mod tests {
 
     #[test]
     fn simple_interleaved_read_and_write() {
-        let mut cbuf: CBuf<i16, 4> = CBuf::new(0);
-        let cbuf_ptr: *mut CBuf<i16, 4> = &mut cbuf;
+        let mut cbuf: CBuf<i16, 16> = CBuf::new(0);
+        let cbuf_ptr: *mut CBuf<i16, 16> = &mut cbuf;
 
         let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
         let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
 
-        cbuf.buf = [-1, -2, -3, -4];
-        cbuf.next.store(0x16, SeqCst);
-        writer.next = 0x16;
-        reader.next = 0x12;
+        cbuf.buf = [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16];
+        cbuf.next.store(BufIndex::new(0x21), SeqCst);
+        writer.next = BufIndex::new(0x21);
+        reader.next = BufIndex::new(0x12);
 
         let (ts_wr, chans_wr) = TestSequencer::new();
         let (ts_rd, chans_rd) = TestSequencer::new();
@@ -564,9 +592,9 @@ mod tests {
         let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
         let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
 
-        cbuf.next.store(0x2005, SeqCst);
-        writer.next = 0x2005;
-        reader.next = 0x1005;
+        cbuf.next.store(BufIndex::new(0x2005), SeqCst);
+        writer.next = BufIndex::new(0x2005);
+        reader.next = BufIndex::new(0x1006);
 
         let (ts_wr, chans_wr) = TestSequencer::new();
         let (ts_rd, chans_rd) = TestSequencer::new();
@@ -602,7 +630,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     enum TraceStep<T> {
         Reader(FetchCheckpoint<ReadResult<T>>),
-        Writer(u32),
+        Writer(WriteProtocolStep),
     }
 
     fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
@@ -615,7 +643,7 @@ mod tests {
     where T: CBufItem,
     GEN: Fn() -> CBuf<T, SIZE>,
     RD: Fn(CBufReader<'static, T, SIZE>, TestSequencer<FetchCheckpoint<ReadResult<T>>>) -> JoinHandle<()>,
-    WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<u32>) -> JoinHandle<()>,
+    WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<WriteProtocolStep>) -> JoinHandle<()>,
     A: FnMut(&[TraceStep<T>]) {
         use std::boxed::Box;
 
@@ -630,7 +658,7 @@ mod tests {
         struct RunningState<U, const SZ: usize> where U: CBufItem {
             cbuf: Box<CBuf<U, SZ>>,
             trace: Vec<TraceStep<U>>,
-            chans_wr: ChannelPair<u32>,
+            chans_wr: ChannelPair<WriteProtocolStep>,
             chans_rd: ChannelPair<FetchCheckpoint<ReadResult<U>>>,
             jhandles: [JoinHandle<()>; 2],
         }
@@ -651,7 +679,7 @@ mod tests {
                 cbuf: unsafe { &mut *cbuf_ptr },
             };
             let mut buf_reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-            buf_reader.next = initial_read_next;
+            buf_reader.next = BufIndex::new(initial_read_next);
 
             let (ts_wr, chans_wr) = TestSequencer::new();
             let (ts_rd, chans_rd) = TestSequencer::new();
@@ -795,7 +823,7 @@ mod tests {
             &|| {
                 CBuf {
                     buf: iota::<16>(),
-                    next: 0x14.into()
+                    next: AtomicIndex::new(0x14),
                 }
             },
             &|mut reader, sequencer| {
@@ -828,7 +856,7 @@ mod tests {
             &|| {
                 CBuf {
                     buf: iota::<16>(),
-                    next: 0x14.into(),
+                    next: AtomicIndex::new(0x14),
                 }
             },
             &|mut reader, sequencer| {
@@ -906,15 +934,17 @@ mod tests {
 
     /// A test case with one write and one read where interference is possible in some cases.
     #[test]
-    fn mini_model_interference_1w1r() {
+    fn mini_model_interference_1w1r_no_ff() {
         use TraceStep as TS;
         use FetchCheckpoint as FC;
+        use ReadProtocolStep as RPS;
+        use WriteProtocolStep as WPS;
 
         iterate_over_event_sequences(
             &|| {
                 CBuf {
                     buf: iota::<16>(),
-                    next: 0x24.into(),
+                    next: AtomicIndex::new(0x23),
                 }
             },
             &|mut reader, sequencer| {
@@ -931,6 +961,7 @@ mod tests {
             &mut |trace| {
                 std::eprintln!("testing {:?}", trace);
 
+                // something should have happened
                 assert!(trace.len() > 0);
 
                 // there should be one return from fetch_next_item_seq() :)
@@ -939,30 +970,150 @@ mod tests {
                     1
                 );
 
+                // return value should be one of Success(4), Skipped(5), and SpinFail
+                let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
+                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
+                    _ => unreachable!(),
+                };
+                assert_let!(return_value, RR::Success(4) | RR::Skipped(5) | RR::SpinFail);
+
                 for (i, t) in trace.iter().enumerate() {
-                    // if we read from the buffer entry in a temporal interval
-                    // containing a write to that entry, make sure we read again afterward:
-                    if *t == TS::Reader(FC::Step(2)) {
-                        match prev_with_pat!(trace, i, TS::Writer(_)) {
-                            Some(TS::Writer(1)) | Some(TS::Writer(2)) => {
-                                assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(2))).is_some());
+                    // if, in the interval between the IndexCheckPre and IndexCheckPost,
+                    // an IndexPostUpdate occurs, the reader should do another read sequence
+                    // (or call it quits with a return of SpinFail)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) {
+                        let mut j = i;
+                        let interleaved_postupdate = 'x: loop {
+                            while j > 0 {
+                                j -= 1;
+                                match trace[j] {
+                                    TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
+                                    TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
+                                    _ => {}
+                                }
                             }
-                            _ => (),
+                            panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
+                        };
+                        if interleaved_postupdate {
+                            assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
                         }
                     }
 
-                    // the last read should occur either before the write sequence starts
-                    // or after the write sequence ends.
-                    if *t == TS::Reader(FC::Step(2)) && next_with_pat!(trace, i, TS::Reader(FC::Step(2))) == None {
-                        let prev_write_step = prev_with_pat!(trace, i, TS::Writer(_));
-                        let next_write_step = next_with_pat!(trace, i, TS::Writer(_));
+                    // if the last read sequence occurs entirely before the write sequence,
+                    // we should return Success(4)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
+                        if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            assert_eq!(return_value, RR::Success(4));
+                        }
+                    }
 
-                        assert!((prev_write_step == Some(TS::Writer(3)) && next_write_step == None)
-                             || (prev_write_step == None && next_write_step == Some(TS::Writer(1))),
-                            "last read should be entirely before or entirely after write sequence");
+                    // if the last read sequence occurs entirely after the write sequence,
+                    // we should return Skipped(5) or, if *right* after the write sequence,
+                    // possibly SpinFail
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
+                        if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
+                                assert_let!(return_value, RR::Skipped(5) | RR::SpinFail);
+                            } else {
+                                assert_eq!(return_value, RR::Skipped(5));
+                            }
+                        }
                     }
                 }
             }
         );
+    }
+
+    #[test]
+    fn mini_model_interference_1w1r_ff() {
+        use TraceStep as TS;
+        use FetchCheckpoint as FC;
+        use ReadProtocolStep as RPS;
+        use WriteProtocolStep as WPS;
+
+        iterate_over_event_sequences(
+            &|| {
+                CBuf {
+                    buf: iota::<16>(),
+                    next: AtomicIndex::new(0x23),
+                }
+            },
+            &|mut reader, sequencer| {
+                spawn(move || {
+                    let _ = reader.fetch_next_item_seq(true, &sequencer);
+                })
+            },
+            0x14,
+            &|mut writer, sequencer| {
+                spawn(move || {
+                    writer.add_item_seq(42, &sequencer);
+                })
+            },
+            &mut |trace| {
+                std::eprintln!("testing {:?}", trace);
+
+                // something should have happened in the course of things:
+                assert!(trace.len() > 0);
+
+                // there should be only one return from fetch_next_item_seq()
+                assert_eq!(
+                    trace.iter().filter(|t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
+                    1
+                );
+
+                // return value of fetch should be one of Success(4), Skipped(42), and SpinFail
+                let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
+                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
+                    _ => unreachable!(),
+                };
+                assert_let!(return_value, RR::Success(4) | RR::Skipped(42) | RR::SpinFail);
+
+                for (i, t) in trace.iter().enumerate() {
+                    // if, in the interval between the IndexCheckPre and IndexCheckPost,
+                    // an IndexPostUpdate occurs, the reader should do another read sequence
+                    // (or call it quits with a return of SpinFail)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) {
+                        let mut j = i;
+                        let interleaved_postupdate = 'x: loop {
+                            while j > 0 {
+                                j -= 1;
+                                match trace[j] {
+                                    TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
+                                    TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
+                                    _ => {}
+                                }
+                            }
+                            panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
+                        };
+                        if interleaved_postupdate {
+                            assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
+                        }
+                    }
+
+                    // if the last read sequence occurs entirely before the write sequence,
+                    // we should return Success(4)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
+                        if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            assert_eq!(return_value, RR::Success(4));
+                        }
+                    }
+
+                    // if the last read sequence occurs entirely after the write sequence,
+                    // we should return Skipped(42), or, if *right* after the write sequence,
+                    // possibly SpinFail
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
+                        if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
+                                assert_let!(return_value, RR::Skipped(42) | RR::SpinFail);
+                            } else {
+                                assert_let!(return_value, RR::Skipped(42));
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+        //std::panic!("HA! HA! I'm using the Internet!!1");
     }
 }

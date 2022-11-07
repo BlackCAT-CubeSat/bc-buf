@@ -1,13 +1,14 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors
+// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Iterators related to circular buffers.
 
 use super::*;
+use crate::utils::BufIndex;
 
 pub(crate) struct CBufWriterIterator<'a, 'b, T: CBufItem, const SIZE: usize> where 'a: 'b {
     pub(crate) writer: &'b mut CBufWriter<'a, T, SIZE>,
-    pub(crate) idx: usize,
+    pub(crate) idx: BufIndex<SIZE>,
 }
 
 impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufWriterIterator<'a, 'b, T, SIZE> where 'a: 'b {
@@ -17,8 +18,8 @@ impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufWriterIterator<'a,
         if self.idx == self.writer.next { return None; }
 
         let old_idx = self.idx;
-        self.idx = old_idx.wrapping_add(1);
-        Some(self.writer.cbuf.buf[old_idx & CBuf::<T, SIZE>::IDX_MASK])
+        self.idx += 1;
+        Some(self.writer.cbuf.buf[old_idx.as_usize() & CBuf::<T, SIZE>::IDX_MASK])
     }
 }
 
@@ -44,7 +45,7 @@ impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufReaderIterator<'a,
 #[cfg(test)]
 mod iterator_tests {
     use crate::*;
-    use core::sync::atomic::AtomicUsize;
+    use crate::utils::AtomicIndex;
 
     const M4: usize = usize::MAX - 4 + 1;
 
@@ -52,7 +53,7 @@ mod iterator_tests {
     where T: CBufItem + core::fmt::Debug + PartialEq {
         let mut cbuf: CBuf<T, SIZE> = CBuf {
             buf: init_buf,
-            next: AtomicUsize::new(init_next),
+            next: AtomicIndex::new(init_next),
         };
 
         {
@@ -74,7 +75,7 @@ mod iterator_tests {
 
         {
             let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
-            cbuf_reader.next = cbuf_reader.next.sub_index::<SIZE>(SIZE);
+            cbuf_reader.next = cbuf_reader.next - (SIZE-1);
             let mut reader_iter = cbuf_reader.available_items(false);
             for i in expected_results {
                 assert_eq!(reader_iter.next(), Some(ReadResult::Success(*i)));
@@ -91,22 +92,22 @@ mod iterator_tests {
         run_test(buf, 1, &[1]);
         run_test(buf, 2, &[1, 2]);
         run_test(buf, 3, &[1, 2, 3]);
-        run_test(buf, 4, &[1, 2, 3, 4]);
+        run_test(buf, 4, &[2, 3, 4]);
     }
 
     #[test]
     fn full_cbuf4() {
-        let buf = [-1i16, -2, -3, -4];
-        run_test(buf, 5, &[-2, -3, -4, -1]);
-        run_test(buf, 6, &[-3, -4, -1, -2]);
-        run_test(buf, 7, &[-4, -1, -2, -3]);
-        run_test(buf, 8, &[-1, -2, -3, -4]);
-        run_test(buf, 9, &[-2, -3, -4, -1]);
+        let buf = [-0i16, -1, -2, -3];
+        run_test(buf, 5, &[-2, -3, -0]);
+        run_test(buf, 6, &[-3, -0, -1]);
+        run_test(buf, 7, &[-0, -1, -2]);
+        run_test(buf, 8, &[-1, -2, -3]);
+        run_test(buf, 9, &[-2, -3, -0]);
 
-        run_test(buf, M4-1, &[-4, -1, -2, -3]);
-        run_test(buf, M4,   &[-1, -2, -3, -4]);
-        run_test(buf, M4+1, &[-2, -3, -4, -1]);
-        run_test(buf, M4+2, &[-3, -4, -1, -2]);
-        run_test(buf, M4+3, &[-4, -1, -2, -3]);
+        run_test(buf, M4-1, &[-0, -1, -2]);
+        run_test(buf, M4,   &[-1, -2, -3]);
+        run_test(buf, M4+1, &[-2, -3, -0]);
+        run_test(buf, M4+2, &[-3, -0, -1]);
+        run_test(buf, M4+3, &[-0, -1, -2]);
     }
 }
