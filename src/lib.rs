@@ -1,7 +1,8 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors
+// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Nonblocking single-writer, multiple-reader circular buffers
+//! Nonblocking single-writer, multiple-reader,
+//! zero-or-one-allocation circular buffers
 //! for sharing data across threads and processes
 //! (with possible misses by readers).
 
@@ -232,6 +233,8 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
                 item
             };
             let next_1 = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
+            #[cfg(test)]
+            std::eprintln!("next: 0x{:02x}    0: 0x{:02x}    1: 0x{:02x}", self.next.as_usize(), next_0.as_usize(), next_1.as_usize());
 
             let next_next = self.next + 1;
 
@@ -286,6 +289,7 @@ mod tests {
     use super::ReadResult as RR;
     use core::mem::drop;
     use core::sync::atomic::Ordering::SeqCst;
+    use std::panic;
     use std::thread::{spawn, JoinHandle};
     use std::sync::mpsc;
     use crate::utils::TestSequencer;
@@ -988,7 +992,7 @@ mod tests {
                                     _ => {}
                                 }
                             }
-                            break false;
+                            panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
                         };
                         if interleaved_postupdate {
                             assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
@@ -1018,5 +1022,98 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn mini_model_interference_1w1r_ff() {
+        use TraceStep as TS;
+        use FetchCheckpoint as FC;
+        use ReadProtocolStep as RPS;
+        use WriteProtocolStep as WPS;
+
+        iterate_over_event_sequences(
+            &|| {
+                CBuf {
+                    buf: iota::<16>(),
+                    next: AtomicIndex::new(0x23),
+                }
+            },
+            &|mut reader, sequencer| {
+                spawn(move || {
+                    let _ = reader.fetch_next_item_seq(true, &sequencer);
+                })
+            },
+            0x14,
+            &|mut writer, sequencer| {
+                spawn(move || {
+                    writer.add_item_seq(42, &sequencer);
+                })
+            },
+            &mut |trace| {
+                std::eprintln!("testing {:?}", trace);
+
+                // something should have happened in the course of things:
+                assert!(trace.len() > 0);
+
+                // there should be only one return from fetch_next_item_seq()
+                assert_eq!(
+                    trace.iter().filter(|t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
+                    1
+                );
+
+                // return value of fetch should be one of Success(4), Skipped(42), and SpinFail
+                let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
+                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
+                    _ => unreachable!(),
+                };
+                assert_let!(return_value, RR::Success(4) | RR::Skipped(42) | RR::SpinFail);
+
+                for (i, t) in trace.iter().enumerate() {
+                    // if, in the interval between the IndexCheckPre and IndexCheckPost,
+                    // an IndexPostUpdate occurs, the reader should do another read sequence
+                    // (or call it quits with a return of SpinFail)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) {
+                        let mut j = i;
+                        let interleaved_postupdate = 'x: loop {
+                            while j > 0 {
+                                j -= 1;
+                                match trace[j] {
+                                    TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
+                                    TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
+                                    _ => {}
+                                }
+                            }
+                            panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
+                        };
+                        if interleaved_postupdate {
+                            assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
+                        }
+                    }
+
+                    // if the last read sequence occurs entirely before the write sequence,
+                    // we should return Success(4)
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
+                        if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            assert_eq!(return_value, RR::Success(4));
+                        }
+                    }
+
+                    // if the last read sequence occurs entirely after the write sequence,
+                    // we should return Skipped(42), or, if *right* after the write sequence,
+                    // possibly SpinFail
+                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
+                        if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
+                            if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
+                                assert_let!(return_value, RR::Skipped(42) | RR::SpinFail);
+                            } else {
+                                assert_let!(return_value, RR::Skipped(42));
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+        //std::panic!("HA! HA! I'm using the Internet!!1");
     }
 }
