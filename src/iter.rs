@@ -4,34 +4,36 @@
 //! Iterators related to circular buffers.
 
 use super::*;
-use crate::utils::BufIndex;
 
-pub(crate) struct CBufWriterIterator<'a, 'b, T: CBufItem, const SIZE: usize>
+pub(crate) struct WriterIterator<'a, 'b, T: CBufItem, const SIZE: usize>
 where
     'a: 'b,
 {
-    pub(crate) writer: &'b mut CBufWriter<'a, T, SIZE>,
-    pub(crate) idx:    BufIndex<SIZE>,
+    pub(crate) _writer:     &'b mut CBufWriter<'a, T, SIZE>,
+    pub(crate) writer_next: CBufIndex<SIZE>,
+    pub(crate) buf:         &'a [T; SIZE],
+    pub(crate) idx:         CBufIndex<SIZE>,
 }
 
-impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufWriterIterator<'a, 'b, T, SIZE>
+impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for WriterIterator<'a, 'b, T, SIZE>
 where
     'a: 'b,
 {
     type Item = T;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx == self.writer.next {
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        if self.idx == self.writer_next {
             return None;
         }
 
         let old_idx = self.idx;
         self.idx += 1;
-        Some(self.writer.cbuf.buf[old_idx.as_usize() & CBuf::<T, SIZE>::IDX_MASK])
+        Some(self.buf[old_idx.as_usize() & CBuf::<T, SIZE>::IDX_MASK])
     }
 }
 
-pub(crate) struct CBufReaderIterator<'a, 'b, T: CBufItem, const SIZE: usize>
+pub(crate) struct ReaderIterator<'a, 'b, T: CBufItem, const SIZE: usize>
 where
     'a: 'b,
 {
@@ -40,7 +42,7 @@ where
     pub(crate) is_done:      bool,
 }
 
-impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for CBufReaderIterator<'a, 'b, T, SIZE>
+impl<'a, 'b, T: CBufItem, const SIZE: usize> Iterator for ReaderIterator<'a, 'b, T, SIZE>
 where
     'a: 'b,
 {
@@ -79,7 +81,7 @@ mod iterator_tests {
 
         {
             let mut cbuf_writer = cbuf.as_writer();
-            let mut cbuf_iter = cbuf_writer.current_items();
+            let mut cbuf_iter = cbuf_writer.current_items_iter();
             for i in expected_results {
                 assert_eq!(cbuf_iter.next(), Some(*i));
             }
@@ -87,17 +89,20 @@ mod iterator_tests {
             assert_eq!(cbuf_iter.next(), None);
         }
 
+        let (buf_ptr, next_ptr) = cbuf.as_ptrs();
         {
-            let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
-            let mut reader_iter = cbuf_reader.available_items(false);
+            let mut cbuf_reader: CBufReader<T, SIZE> =
+                unsafe { CBufReader::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+            let mut reader_iter = cbuf_reader.available_items_iter(false);
             assert_eq!(reader_iter.next(), None);
             assert_eq!(reader_iter.next(), None);
         }
 
         {
-            let mut cbuf_reader = unsafe { CBufReader::from_ptr(&cbuf) }.unwrap();
-            cbuf_reader.next = cbuf_reader.next - (SIZE - 1);
-            let mut reader_iter = cbuf_reader.available_items(false);
+            let mut cbuf_reader: CBufReader<T, SIZE> =
+                unsafe { CBufReader::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+            cbuf_reader.next_local = cbuf_reader.next_local - (SIZE - 1);
+            let mut reader_iter = cbuf_reader.available_items_iter(false);
             for i in expected_results {
                 assert_eq!(reader_iter.next(), Some(ReadResult::Success(*i)));
             }

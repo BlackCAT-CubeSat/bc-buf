@@ -89,17 +89,17 @@ fn add_an_item() {
 #[test]
 fn write_then_read() {
     let mut cbuf: CBuf<u32, 16> = CBuf::new_with_default();
-    let cbuf_ptr: *mut CBuf<u32, 16> = &mut cbuf;
+    let (buf_ptr, next_ptr) = cbuf.as_mut_ptrs();
 
-    let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-    let mut reader1 = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+    let mut writer = unsafe { CBufWriter::<_, 16>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+    let mut reader1 = unsafe { CBufReader::<_, 16>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
 
     assert_eq!(reader1.fetch_next_item(false), RR::None);
 
     writer.add_item(42);
     assert_eq!(reader1.fetch_next_item(false), RR::Success(42));
 
-    let mut reader2 = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+    let mut reader2 = unsafe { CBufReader::<_, 16>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
     assert_eq!(reader2.fetch_next_item(false), RR::None);
 
     writer.add_item(43);
@@ -183,10 +183,10 @@ macro_rules! expect_reader_ret {
 #[test]
 fn very_simple_multithreaded() {
     let mut cbuf: CBuf<(u8, u16), 4> = CBuf::new((0, 0));
-    let cbuf_ptr: *mut CBuf<(u8, u16), 4> = &mut cbuf;
+    let (buf_ptr, next_ptr) = cbuf.as_mut_ptrs();
 
-    let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-    let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+    let mut writer = unsafe { CBufWriter::<_, 4>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+    let mut reader = unsafe { CBufReader::<_, 4>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
 
     let (ts_wr, chans_wr) = TestSequencer::new();
     let (ts_rd, chans_rd) = TestSequencer::new();
@@ -223,15 +223,15 @@ fn very_simple_multithreaded() {
 #[test]
 fn simple_interleaved_read_and_write() {
     let mut cbuf: CBuf<i16, 16> = CBuf::new(0);
-    let cbuf_ptr: *mut CBuf<i16, 16> = &mut cbuf;
+    let (buf_ptr, next_ptr) = cbuf.as_mut_ptrs();
 
-    let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-    let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+    let mut writer = unsafe { CBufWriter::<_, 16>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+    let mut reader = unsafe { CBufReader::<_, 16>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
 
     cbuf.buf = [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16];
-    cbuf.next.store(BufIndex::new(0x21), SeqCst);
-    writer.next = BufIndex::new(0x21);
-    reader.next = BufIndex::new(0x12);
+    cbuf.next.store(CBufIndex::new(0x21), SeqCst);
+    writer.next_local = CBufIndex::new(0x21);
+    reader.next_local = CBufIndex::new(0x12);
 
     let (ts_wr, chans_wr) = TestSequencer::new();
     let (ts_rd, chans_rd) = TestSequencer::new();
@@ -295,14 +295,14 @@ fn get_to_spinfail() {
     let NUM_READ_TRIES = CBufReader::<(), 4096>::NUM_READ_TRIES;
 
     let mut cbuf: CBuf<(), 4096> = CBuf::new_with_default();
-    let cbuf_ptr: *mut CBuf<(), 4096> = &mut cbuf;
+    let (buf_ptr, next_ptr) = cbuf.as_mut_ptrs();
 
-    let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-    let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
+    let mut writer = unsafe { CBufWriter::<_, 4096>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+    let mut reader = unsafe { CBufReader::<_, 4096>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
 
-    cbuf.next.store(BufIndex::new(0x2005), SeqCst);
-    writer.next = BufIndex::new(0x2005);
-    reader.next = BufIndex::new(0x1006);
+    cbuf.next.store(CBufIndex::new(0x2005), SeqCst);
+    writer.next_local = CBufIndex::new(0x2005);
+    reader.next_local = CBufIndex::new(0x1006);
 
     let (ts_wr, chans_wr) = TestSequencer::new();
     let (ts_rd, chans_rd) = TestSequencer::new();
@@ -388,15 +388,13 @@ fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
         //std::eprintln!("replaying {:?}", chain);
 
         let mut cbuf = Box::new(generator());
-        let cbuf_ptr: *mut CBuf<T, SIZE> = cbuf.as_mut();
         let mut trace: Vec<TraceStep<T>> = Vec::with_capacity(chain.len());
 
-        let buf_writer = CBufWriter {
-            next: cbuf.next.load(SeqCst),
-            cbuf: unsafe { &mut *cbuf_ptr },
-        };
-        let mut buf_reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-        buf_reader.next = BufIndex::new(initial_read_next);
+        let buf_writer =
+            unsafe { CBufWriter::new_from_ptr(cbuf.buf.as_mut_ptr(), &cbuf.next.n) }.unwrap();
+        let mut buf_reader =
+            unsafe { CBufReader::new_from_ptr(cbuf.buf.as_ptr(), &cbuf.next.n) }.unwrap();
+        buf_reader.next_local = CBufIndex::new(initial_read_next);
 
         let (ts_wr, chans_wr) = TestSequencer::new();
         let (ts_rd, chans_rd) = TestSequencer::new();

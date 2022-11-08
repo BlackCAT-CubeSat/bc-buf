@@ -14,9 +14,11 @@ extern crate std;
 pub(crate) mod iter;
 pub(crate) mod utils;
 
-use crate::utils::{AtomicIndex, BufIndex, Sequencer};
+pub use crate::utils::CBufIndex;
+use crate::utils::{AtomicIndex, Sequencer};
+
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering::SeqCst};
+use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
 
 /// A convenience trait for possible items
 /// read from and written to a circular buffer.
@@ -29,6 +31,18 @@ impl<T> CBufItem for T where T: Sized + Copy + Send + 'static {}
 pub struct CBuf<T: CBufItem, const SIZE: usize> {
     buf:  [T; SIZE],
     next: AtomicIndex<SIZE>,
+}
+
+pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
+    buf:        *const T,
+    next_ref:   &'a AtomicIndex<SIZE>,
+    next_local: CBufIndex<SIZE>,
+}
+
+pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
+    buf:        *mut T,
+    next_ref:   &'a AtomicIndex<SIZE>,
+    next_local: CBufIndex<SIZE>,
 }
 
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
@@ -44,7 +58,7 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
 
     #[inline]
-    pub fn new(filler_item: T) -> Self {
+    pub const fn new(filler_item: T) -> Self {
         let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 1 };
 
         CBuf {
@@ -71,9 +85,20 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     #[inline]
     pub fn as_writer<'a>(&'a mut self) -> CBufWriter<'a, T, SIZE> {
         CBufWriter {
-            next: self.next.load(SeqCst),
-            cbuf: self,
+            buf:        self.buf.as_mut_ptr(),
+            next_ref:   &self.next,
+            next_local: self.next.load(SeqCst),
         }
+    }
+
+    #[inline]
+    pub const fn as_ptrs(&self) -> (*const T, *const AtomicUsize) {
+        (self.buf.as_ptr(), &self.next.n)
+    }
+
+    #[inline]
+    pub fn as_mut_ptrs(&mut self) -> (*mut T, *const AtomicUsize) {
+        (self.buf.as_mut_ptr(), &self.next.n)
     }
 }
 
@@ -89,31 +114,25 @@ impl<T: CBufItem + Default, const SIZE: usize> CBuf<T, SIZE> {
     }
 }
 
-pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
-    cbuf: &'a mut CBuf<T, SIZE>,
-    next: BufIndex<SIZE>,
-}
-
-pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
-    cbuf: &'a CBuf<T, SIZE>,
-    next: BufIndex<SIZE>,
-}
+unsafe impl<'a, T: CBufItem, const SIZE: usize> Send for CBufWriter<'a, T, SIZE> {}
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
     const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
 
-    pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, SIZE>) -> Option<Self> {
-        if !Self::IS_SIZE_OK {
+    #[inline]
+    pub unsafe fn new_from_ptr(buf: *mut T, next_idx: *const AtomicUsize) -> Option<Self> {
+        if !Self::IS_SIZE_OK || buf.is_null() || next_idx.is_null()
+        /*|| !buf.is_aligned() || !next_idx.is_aligned()*/
+        {
             return None;
         }
-        let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
 
-        cbuf.next.store(BufIndex::ZERO, SeqCst);
-
-        Some(CBufWriter {
-            cbuf: cbuf,
-            next: BufIndex::ZERO,
+        let next_ref: &AtomicIndex<SIZE> = &*(next_idx as *const AtomicIndex<SIZE>);
+        Some(Self {
+            buf,
+            next_ref,
+            next_local: next_ref.load(SeqCst),
         })
     }
 
@@ -124,8 +143,6 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
 
     #[inline]
     pub(crate) fn add_item_seq<S: Sequencer<WriteProtocolStep>>(&mut self, item: T, seq: &S) {
-        use core::ptr::addr_of_mut;
-
         macro_rules! wrap_atomic {
             ($label:ident, $($x:tt)*) => {
                 seq.wait_for_go_ahead();
@@ -134,26 +151,150 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
             };
         }
 
-        let next_next = self.next + 1;
+        let next_next = self.next_local + 1;
 
         wrap_atomic! { PreWrite, }
         wrap_atomic! { BufferWrite,
             fence(SeqCst);
-            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next.as_usize() & Self::IDX_MASK]), item) };
+            unsafe { write_volatile(self.buf.add(self.next_local.as_usize() & Self::IDX_MASK), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { IndexPostUpdate, self.cbuf.next.store(next_next, SeqCst); }
+        wrap_atomic! { IndexPostUpdate, self.next_ref.store(next_next, SeqCst); }
 
-        self.next = next_next;
+        self.next_local = next_next;
     }
 
-    pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a>
+    #[inline]
+    pub fn current_items_iter<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a>
     where
         'a: 'b,
     {
-        iter::CBufWriterIterator {
-            idx:    self.next - (SIZE - 1),
-            writer: self,
+        iter::WriterIterator {
+            writer_next: self.next_local,
+            buf:         unsafe { &*(self.buf as *const [T; SIZE]) },
+            idx:         self.next_local - (SIZE - 1),
+            _writer:     self,
+        }
+    }
+}
+
+unsafe impl<'a, T: CBufItem, const SIZE: usize> Send for CBufReader<'a, T, SIZE> {}
+
+impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
+    const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
+    const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
+
+    const NUM_READ_TRIES: u32 = 16;
+
+    #[inline]
+    pub unsafe fn new_from_ptr(buf: *const T, next_idx: *const AtomicUsize) -> Option<Self> {
+        if !Self::IS_SIZE_OK || buf.is_null() || next_idx.is_null()
+        /*|| !buf.is_aligned() || !next_idx.is_aligned()*/
+        {
+            return None;
+        }
+
+        let next_ref: &AtomicIndex<SIZE> = &*(next_idx as *const AtomicIndex<SIZE>);
+        Some(Self {
+            buf,
+            next_ref,
+            next_local: next_ref.load(SeqCst),
+        })
+    }
+
+    #[inline(always)]
+    pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
+        self.fetch_next_item_seq(fast_forward, &())
+    }
+
+    #[inline]
+    pub(crate) fn fetch_next_item_seq<S>(&mut self, fast_forward: bool, seq: &S) -> ReadResult<T>
+    where
+        S: Sequencer<FetchCheckpoint<ReadResult<T>>>,
+    {
+        use ReadResult as RR;
+
+        macro_rules! wrap_atomic {
+            ($label:ident, $($x:tt)*) => {
+                {
+                    seq.wait_for_go_ahead();
+                    let x = { $($x)* };
+                    seq.send_result(FetchCheckpoint::Step(ReadProtocolStep::$label));
+                    x
+                }
+            };
+        }
+        macro_rules! send_and_return {
+            ($result:expr) => {
+                seq.wait_for_go_ahead();
+                let x = $result;
+                seq.send_result(FetchCheckpoint::ReturnVal(x));
+                return x;
+            };
+        }
+
+        let mut skipped = false;
+
+        for _ in 0..Self::NUM_READ_TRIES {
+            let next_0 = wrap_atomic! { IndexCheckPre, self.next_ref.load(SeqCst) };
+            let item = wrap_atomic! { BufferRead,
+                fence(SeqCst);
+                let item = unsafe { read_volatile(self.buf.add(self.next_local.as_usize() & Self::IDX_MASK)) };
+                fence(SeqCst);
+                item
+            };
+            let next_1 = wrap_atomic! { IndexCheckPost, self.next_ref.load(SeqCst) };
+            #[cfg(test)]
+            std::eprintln!(
+                "next: 0x{:02x}    0: 0x{:02x}    1: 0x{:02x}",
+                self.next_local.as_usize(),
+                next_0.as_usize(),
+                next_1.as_usize()
+            );
+
+            let next_next = self.next_local + 1;
+
+            if next_1 == CBufIndex::ZERO {
+                send_and_return!(RR::None);
+            }
+            if (self.next_local == next_0) && (self.next_local == next_1) {
+                send_and_return!(RR::None);
+            }
+
+            if next_0.is_in_range(next_next, SIZE - 1) && next_1.is_in_range(next_next, SIZE - 1) {
+                self.next_local = next_next;
+                send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
+            }
+
+            if !(next_1.is_in_range(next_next, SIZE - 1)) {
+                // we've gotten too far behind, and we've gotten wrapped by the writer,
+                // or else the circular buffer's been re-initialized;
+                // in either case, we need to play catch-up
+                let offset = if fast_forward { 1 } else { SIZE - 1 };
+                self.next_local = next_1 - offset;
+                skipped = true;
+            }
+
+            if next_0 != next_1 {
+                // writer is active, let's give a hint to cool this thread's jets:
+                core::hint::spin_loop();
+            }
+        }
+
+        send_and_return!(RR::SpinFail);
+    }
+
+    pub fn available_items_iter<'b>(
+        &'b mut self,
+        fast_forward: bool,
+    ) -> impl Iterator<Item = ReadResult<T>> + 'b + Captures<'a>
+    where
+        'a: 'b,
+    {
+        iter::ReaderIterator {
+            reader: self,
+            fast_forward,
+            is_done: false,
         }
     }
 }
@@ -188,124 +329,6 @@ pub(crate) enum ReadProtocolStep {
 pub(crate) enum FetchCheckpoint<T> {
     Step(ReadProtocolStep),
     ReturnVal(T),
-}
-
-impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
-    const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
-    const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
-
-    pub unsafe fn from_ptr(cbuf: *const CBuf<T, SIZE>) -> Option<Self> {
-        if !Self::IS_SIZE_OK {
-            return None;
-        }
-        let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
-
-        Some(CBufReader {
-            cbuf: cbuf,
-            next: cbuf.next.load(SeqCst),
-        })
-    }
-
-    const NUM_READ_TRIES: u32 = 16;
-
-    #[inline]
-    pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
-        self.fetch_next_item_seq(fast_forward, &())
-    }
-
-    #[inline]
-    pub(crate) fn fetch_next_item_seq<S>(&mut self, fast_forward: bool, seq: &S) -> ReadResult<T>
-    where
-        S: Sequencer<FetchCheckpoint<ReadResult<T>>>,
-    {
-        use core::ptr::addr_of;
-
-        use ReadResult as RR;
-
-        macro_rules! wrap_atomic {
-            ($label:ident, $($x:tt)*) => {
-                {
-                    seq.wait_for_go_ahead();
-                    let x = { $($x)* };
-                    seq.send_result(FetchCheckpoint::Step(ReadProtocolStep::$label));
-                    x
-                }
-            };
-        }
-        macro_rules! send_and_return {
-            ($result:expr) => {
-                seq.wait_for_go_ahead();
-                let x = $result;
-                seq.send_result(FetchCheckpoint::ReturnVal(x));
-                return x;
-            };
-        }
-
-        let cbuf = self.cbuf;
-        let mut skipped = false;
-
-        for _ in 0..Self::NUM_READ_TRIES {
-            let next_0 = wrap_atomic! { IndexCheckPre, cbuf.next.load(SeqCst) };
-            let item = wrap_atomic! { BufferRead,
-                fence(SeqCst);
-                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next.as_usize() & Self::IDX_MASK])) };
-                fence(SeqCst);
-                item
-            };
-            let next_1 = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
-            #[cfg(test)]
-            std::eprintln!(
-                "next: 0x{:02x}    0: 0x{:02x}    1: 0x{:02x}",
-                self.next.as_usize(),
-                next_0.as_usize(),
-                next_1.as_usize()
-            );
-
-            let next_next = self.next + 1;
-
-            if next_1 == BufIndex::ZERO {
-                send_and_return!(RR::None);
-            }
-            if (self.next == next_0) && (self.next == next_1) {
-                send_and_return!(RR::None);
-            }
-
-            if next_0.is_in_range(next_next, SIZE - 1) && next_1.is_in_range(next_next, SIZE - 1) {
-                self.next = next_next;
-                send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
-            }
-
-            if !(next_1.is_in_range(next_next, SIZE - 1)) {
-                // we've gotten too far behind, and we've gotten wrapped by the writer,
-                // or else the circular buffer's been re-initialized;
-                // in either case, we need to play catch-up
-                let offset = if fast_forward { 1 } else { SIZE - 1 };
-                self.next = next_1 - offset;
-                skipped = true;
-            }
-
-            if next_0 != next_1 {
-                // writer is active, let's give a hint to cool this thread's jets:
-                core::hint::spin_loop();
-            }
-        }
-
-        send_and_return!(RR::SpinFail);
-    }
-
-    pub fn available_items<'b>(
-        &'b mut self,
-        fast_forward: bool,
-    ) -> impl Iterator<Item = ReadResult<T>> + 'b + Captures<'a>
-    where
-        'a: 'b,
-    {
-        iter::CBufReaderIterator {
-            reader: self,
-            fast_forward,
-            is_done: false,
-        }
-    }
 }
 
 /// Dummy trait used to satiate the Rust compiler

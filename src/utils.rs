@@ -12,11 +12,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct BufIndex<const SIZE: usize> {
+pub struct CBufIndex<const SIZE: usize> {
     idx: usize,
 }
 
-impl<const SIZE: usize> BufIndex<SIZE> {
+impl<const SIZE: usize> CBufIndex<SIZE> {
     const IS_SIZE_OK: bool = CBuf::<(), SIZE>::IS_SIZE_OK;
 
     #[inline]
@@ -36,14 +36,14 @@ impl<const SIZE: usize> BufIndex<SIZE> {
     }
 }
 
-impl<const SIZE: usize> Default for BufIndex<SIZE> {
+impl<const SIZE: usize> Default for CBufIndex<SIZE> {
     #[inline]
     fn default() -> Self {
         Self::new(0)
     }
 }
 
-impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
+impl<const SIZE: usize> Add<usize> for CBufIndex<SIZE> {
     type Output = Self;
 
     #[inline]
@@ -65,14 +65,14 @@ impl<const SIZE: usize> Add<usize> for BufIndex<SIZE> {
     }
 }
 
-impl<const SIZE: usize> AddAssign<usize> for BufIndex<SIZE> {
+impl<const SIZE: usize> AddAssign<usize> for CBufIndex<SIZE> {
     #[inline]
     fn add_assign(&mut self, increment: usize) {
         *self = *self + increment;
     }
 }
 
-impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
+impl<const SIZE: usize> Sub<usize> for CBufIndex<SIZE> {
     type Output = Self;
 
     #[inline]
@@ -97,14 +97,14 @@ impl<const SIZE: usize> Sub<usize> for BufIndex<SIZE> {
     }
 }
 
-impl<const SIZE: usize> SubAssign<usize> for BufIndex<SIZE> {
+impl<const SIZE: usize> SubAssign<usize> for CBufIndex<SIZE> {
     #[inline]
     fn sub_assign(&mut self, decrement: usize) {
         *self = *self - decrement;
     }
 }
 
-impl<const SIZE: usize> BufIndex<SIZE> {
+impl<const SIZE: usize> CBufIndex<SIZE> {
     const LOOP_LENGTH: usize = usize::MAX - SIZE + 1;
 
     #[inline]
@@ -134,7 +134,7 @@ impl<const SIZE: usize> BufIndex<SIZE> {
 
 #[repr(transparent)]
 pub(crate) struct AtomicIndex<const SIZE: usize> {
-    n: AtomicUsize,
+    pub(crate) n: AtomicUsize,
 }
 
 impl<const SIZE: usize> AtomicIndex<SIZE> {
@@ -144,12 +144,12 @@ impl<const SIZE: usize> AtomicIndex<SIZE> {
     }
 
     #[inline]
-    pub(crate) fn load(&self, order: Ordering) -> BufIndex<SIZE> {
-        BufIndex { idx: self.n.load(order) }
+    pub(crate) fn load(&self, order: Ordering) -> CBufIndex<SIZE> {
+        CBufIndex { idx: self.n.load(order) }
     }
 
     #[inline]
-    pub(crate) fn store(&self, idx: BufIndex<SIZE>, order: Ordering) {
+    pub(crate) fn store(&self, idx: CBufIndex<SIZE>, order: Ordering) {
         self.n.store(idx.idx, order);
     }
 }
@@ -208,7 +208,7 @@ impl<T: Send> Sequencer<T> for TestSequencer<T> {
 
 #[cfg(test)]
 mod index_tests {
-    use super::BufIndex;
+    use super::CBufIndex;
 
     const M: usize = usize::MAX;
 
@@ -217,11 +217,11 @@ mod index_tests {
             concat!("(<16>(", stringify!($a), ") ", $op, " (", stringify!($b), ") == ", stringify!($result), ")")
         };
         (+, $a:expr, $b:expr, $result:expr) => {
-            assert_eq!(BufIndex::<16>::new($a) + ($b as usize), BufIndex::<16>::new($result),
+            assert_eq!(CBufIndex::<16>::new($a) + ($b as usize), CBufIndex::<16>::new($result),
                 test_case!(@ 16, $a, "+", $b, $result));
         };
         (-, $a:expr, $b:expr, $result:expr) => {
-            assert_eq!(BufIndex::<16>::new($a) - ($b as usize), BufIndex::<16>::new($result),
+            assert_eq!(CBufIndex::<16>::new($a) - ($b as usize), CBufIndex::<16>::new($result),
                 test_case!(@ 16, $a, "-", $b, $result));
         };
     }
@@ -477,11 +477,11 @@ mod index_tests {
             concat!("<16>((", stringify!($a), ").in_range(", stringify!($b), ", ", stringify!($c), ") == ", stringify!($result), ")")
         };
         (@ 0 $a:expr , $b:expr, $c:expr, T) => {
-            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == true,
+            assert!(CBufIndex::<16>::new($a).is_in_range(CBufIndex::new($b), $c) == true,
                 in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 0 $a:expr , $b:expr, $c:expr, F) => {
-            assert!(BufIndex::<16>::new($a).is_in_range(BufIndex::new($b), $c) == false,
+            assert!(CBufIndex::<16>::new($a).is_in_range(CBufIndex::new($b), $c) == false,
                 in_range_tableau!(@ @ $a, $b, $c, true));
         };
         (@ 1 $a:expr ; ( $( ($b:expr, $c:expr) ),* ) ; ( $( $d:ident ),* )) => {
@@ -502,8 +502,8 @@ mod index_tests {
     #[test]
     fn in_range() {
         // Some especially interesting edge cases:
-        fn buf_index(x: usize) -> BufIndex<16> {
-            BufIndex::new(x)
+        fn buf_index(x: usize) -> CBufIndex<16> {
+            CBufIndex::new(x)
         }
         const MM: usize = trim_top_bit(M);
 
