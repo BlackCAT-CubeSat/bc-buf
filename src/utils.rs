@@ -5,7 +5,7 @@
 
 use super::CBuf;
 
-use core::ops::{Add, AddAssign, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Range, Sub, SubAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
@@ -97,6 +97,20 @@ impl<const SIZE: usize> Sub<usize> for CBufIndex<SIZE> {
     }
 }
 
+impl<const SIZE: usize> Sub<CBufIndex<SIZE>> for CBufIndex<SIZE> {
+    type Output = Option<usize>;
+
+    #[inline]
+    fn sub(self, rhs: CBufIndex<SIZE>) -> Option<usize> {
+        if self.idx >= SIZE {
+            let (difference, wrapped) = self.idx.overflowing_sub(rhs.idx);
+            Some(if !wrapped { difference } else { difference.wrapping_sub(SIZE) })
+        } else {
+            self.idx.checked_sub(rhs.idx)
+        }
+    }
+}
+
 impl<const SIZE: usize> SubAssign<usize> for CBufIndex<SIZE> {
     #[inline]
     fn sub_assign(&mut self, decrement: usize) {
@@ -128,6 +142,36 @@ impl<const SIZE: usize> CBufIndex<SIZE> {
             } else {
                 (base_ <= idx) || ((SIZE <= idx) && (idx < end))
             }
+        }
+    }
+}
+
+pub trait Bisect: Sized {
+    fn bisect(&self) -> Option<(Self, Self)>;
+}
+
+impl<const SIZE: usize> Bisect for Range<CBufIndex<SIZE>> {
+    #[inline]
+    fn bisect(&self) -> Option<(Self, Self)> {
+        if self.end == (self.start + 1) || (self.start.idx < SIZE && self.end.idx <= self.start.idx)
+        {
+            None
+        } else {
+            let range_size = (self.end - self.start)?;
+            if range_size <= 1 {
+                return None;
+            }
+            let bisector = self.start + (range_size / 2);
+            Some((
+                Range {
+                    start: self.start,
+                    end:   bisector,
+                },
+                Range {
+                    start: bisector,
+                    end:   self.end,
+                },
+            ))
         }
     }
 }

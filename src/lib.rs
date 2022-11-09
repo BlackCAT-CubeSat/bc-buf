@@ -14,9 +14,10 @@ extern crate std;
 pub(crate) mod iter;
 pub(crate) mod utils;
 
-pub use crate::utils::CBufIndex;
 use crate::utils::{AtomicIndex, Sequencer};
+pub use crate::utils::{Bisect, CBufIndex};
 
+use core::ops::Range;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
 
@@ -284,6 +285,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         send_and_return!(RR::SpinFail);
     }
 
+    #[inline]
     pub fn available_items_iter<'b>(
         &'b mut self,
         fast_forward: bool,
@@ -297,7 +299,43 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             is_done: false,
         }
     }
+
+    #[inline]
+    pub fn fast_forward(&mut self) {
+        self.next_local = self.next_ref.load(SeqCst);
+    }
+
+    #[inline]
+    pub fn current_next_index(&self) -> CBufIndex<SIZE> {
+        self.next_local
+    }
+
+    #[inline]
+    pub fn current_valid_index_range(&self) -> Range<CBufIndex<SIZE>> {
+        let next = self.next_ref.load(SeqCst);
+        Range {
+            start: next - (SIZE - 1),
+            end:   next,
+        }
+    }
+
+    #[inline]
+    pub fn fetch(&self, idx: CBufIndex<SIZE>) -> Result<T, OutOfBoundsError> {
+        let next_0 = self.next_ref.load(SeqCst);
+        fence(SeqCst);
+        let item = unsafe { read_volatile(self.buf.add(idx.as_usize() & Self::IDX_MASK)) };
+        fence(SeqCst);
+        let next_1 = self.next_ref.load(SeqCst);
+
+        if next_0.is_in_range(idx, SIZE - 1) && next_1.is_in_range(idx, SIZE - 1) {
+            Ok(item)
+        } else {
+            Err(OutOfBoundsError(()))
+        }
+    }
 }
+
+pub struct OutOfBoundsError(());
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum WriteProtocolStep {
