@@ -339,11 +339,11 @@ fn get_to_spinfail() {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum TraceStep<T> {
-    Reader(FetchCheckpoint<ReadResult<T>>),
+    Reader(FetchCheckpoint<T>),
     Writer(WriteProtocolStep),
 }
 
-fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
+fn iterate_over_event_sequences<GEN, RD, WR, T, RDRET, const SIZE: usize, A>(
     generator: &GEN,
     read_thread_generator: &RD,
     initial_read_next: usize,
@@ -352,12 +352,10 @@ fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
 ) where
     T: CBufItem,
     GEN: Fn() -> CBuf<T, SIZE>,
-    RD: Fn(
-        CBufReader<'static, T, SIZE>,
-        TestSequencer<FetchCheckpoint<ReadResult<T>>>,
-    ) -> JoinHandle<()>,
+    RD: Fn(CBufReader<'static, T, SIZE>, TestSequencer<FetchCheckpoint<RDRET>>) -> JoinHandle<()>,
+    RDRET: Send + Clone,
     WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<WriteProtocolStep>) -> JoinHandle<()>,
-    A: FnMut(&[TraceStep<T>]),
+    A: FnMut(&[TraceStep<RDRET>]),
 {
     use std::boxed::Box;
 
@@ -369,14 +367,14 @@ fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
 
     type ChannelPair<X> = (mpsc::Sender<()>, mpsc::Receiver<X>);
 
-    struct RunningState<U, const SZ: usize>
+    struct RunningState<U, W, const SZ: usize>
     where
         U: CBufItem,
     {
         cbuf:     Box<CBuf<U, SZ>>,
-        trace:    Vec<TraceStep<U>>,
+        trace:    Vec<TraceStep<W>>,
         chans_wr: ChannelPair<WriteProtocolStep>,
-        chans_rd: ChannelPair<FetchCheckpoint<ReadResult<U>>>,
+        chans_rd: ChannelPair<FetchCheckpoint<W>>,
         jhandles: [JoinHandle<()>; 2],
     }
 
@@ -388,7 +386,7 @@ fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
         //std::eprintln!("replaying {:?}", chain);
 
         let mut cbuf = Box::new(generator());
-        let mut trace: Vec<TraceStep<T>> = Vec::with_capacity(chain.len());
+        let mut trace: Vec<TraceStep<RDRET>> = Vec::with_capacity(chain.len());
 
         let buf_writer =
             unsafe { CBufWriter::new_from_ptr(cbuf.buf.as_mut_ptr(), &cbuf.next.n) }.unwrap();
@@ -449,18 +447,19 @@ fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
     let root_state = replay_event_chain(&[]);
 
     let mut recurse_over_event_chains =
-        |event_steps: Vec<EventStep>, currently_running_state: RunningState<T, SIZE>| {
+        |event_steps: Vec<EventStep>, currently_running_state: RunningState<T, RDRET, SIZE>| {
             // Helper function used to allow the logic of the closure to be recursive.
             // Technique due to <https://stackoverflow.com/a/72862424>.
-            fn helper<REC, A, T, const SIZE: usize>(
+            fn helper<REC, A, T, W, const SIZE: usize>(
                 event_steps: Vec<EventStep>,
-                currently_running_state: RunningState<T, SIZE>,
+                currently_running_state: RunningState<T, W, SIZE>,
                 replay_event_chain: &mut REC,
                 action: &mut A,
             ) where
                 T: CBufItem,
-                REC: FnMut(&[EventStep]) -> RunningState<T, SIZE>,
-                A: FnMut(&[TraceStep<T>]),
+                REC: FnMut(&[EventStep]) -> RunningState<T, W, SIZE>,
+                A: FnMut(&[TraceStep<W>]),
+                TraceStep<W>: Clone,
             {
                 use EventStep as ES;
                 use TraceStep as TS;
