@@ -524,19 +524,49 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     /// If successful, returns the item;
     /// if not (see [`fetch_next_item`](Self::fetch_next_item) for possible failure modes),
     /// returns an [`InvalidIndexError`].
-    #[inline]
+    #[inline(always)]
     pub fn fetch(&self, idx: CBufIndex<SIZE>) -> Result<T, InvalidIndexError> {
-        let next_0 = self.next_ref.load(SeqCst);
-        fence(SeqCst);
-        let item = unsafe { read_volatile(self.buf.add(idx.as_usize() & Self::IDX_MASK)) };
-        fence(SeqCst);
-        let next_1 = self.next_ref.load(SeqCst);
+        self.fetch_seq(idx, &())
+    }
 
-        if next_0.is_in_range(idx, SIZE - 1) && next_1.is_in_range(idx, SIZE - 1) {
+    /// The backing logic for [`fetch`](Self::fetch).
+    ///
+    /// Tests in this crate can use non-[`()`] [`Sequencer`] implementors
+    /// to control concurrency.
+    #[inline]
+    pub(crate) fn fetch_seq<S>(&self, idx: CBufIndex<SIZE>, seq: &S) -> Result<T, InvalidIndexError>
+    where
+        S: Sequencer<FetchCheckpoint<Result<T, InvalidIndexError>>>,
+    {
+        macro_rules! wrap_atomic {
+            ($label:ident, $($x:tt)*) => {
+                {
+                    seq.wait_for_go_ahead();
+                    let x = { $($x)* };
+                    seq.send_result(FetchCheckpoint::Step(ReadProtocolStep::$label));
+                    x
+                }
+            };
+        }
+
+        let next_0 = wrap_atomic! { IndexCheckPre, self.next_ref.load(SeqCst) };
+        let item = wrap_atomic! { BufferRead,
+            fence(SeqCst);
+            let item = unsafe { read_volatile(self.buf.add(idx.as_usize() & Self::IDX_MASK)) };
+            fence(SeqCst);
+            item
+        };
+        let next_1 = wrap_atomic! { IndexCheckPost, self.next_ref.load(SeqCst) };
+
+        let retval = if next_0.is_in_range(idx, SIZE - 1) && next_1.is_in_range(idx, SIZE - 1) {
             Ok(item)
         } else {
             Err(InvalidIndexError(()))
-        }
+        };
+
+        seq.wait_for_go_ahead();
+        seq.send_result(FetchCheckpoint::ReturnVal(retval));
+        retval
     }
 }
 
@@ -555,6 +585,7 @@ pub enum ReadResult<T> {
 }
 
 /// Signifies that the index used in [`CBufReader::fetch`] is not valid.
+#[derive(Clone, Copy)]
 pub struct InvalidIndexError(());
 
 /// One of the atomic steps in the protocol used by
