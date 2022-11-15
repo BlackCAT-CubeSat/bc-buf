@@ -169,6 +169,16 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         }
     }
 
+    /// Returns a [`CBufReader`] for reading elements from `self`.
+    #[inline]
+    pub fn as_reader<'a>(&'a self) -> CBufReader<'a, T, SIZE> {
+        CBufReader {
+            buf:        self.buf.as_ptr(),
+            next_ref:   &self.next,
+            next_local: self.next.load(SeqCst),
+        }
+    }
+
     /// Returns a pointer to the start of the backing array (of length `SIZE`)
     /// and a pointer to the circular-buffer state (stored in an [`AtomicUsize`]).
     ///

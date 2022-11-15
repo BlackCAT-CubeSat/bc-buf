@@ -209,6 +209,19 @@ pub trait Bisect: Sized {
     fn bisect(&self) -> Option<(Self, Self)>;
 }
 
+impl<'a, T: Sized> Bisect for &'a [T] {
+    #[inline]
+    fn bisect(&self) -> Option<(Self, Self)> {
+        let s = *self;
+        if s.len() > 1 {
+            let bisector = s.len() / 2;
+            Some((&s[..bisector], &s[bisector..]))
+        } else {
+            None
+        }
+    }
+}
+
 impl<const SIZE: usize> Bisect for Range<CBufIndex<SIZE>> {
     #[inline]
     fn bisect(&self) -> Option<(Self, Self)> {
