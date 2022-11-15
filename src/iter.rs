@@ -5,6 +5,9 @@
 
 use super::*;
 
+/// The iterator returned by [`CBufWriter::current_items_iter`].
+///
+/// Yields the currently-stored items in the backing [`CBuf`].
 pub(crate) struct WriterIterator<'a, 'b, T: CBufItem, const SIZE: usize>
 where
     'a: 'b,
@@ -33,6 +36,7 @@ where
     }
 }
 
+/// The iterator returned by [`CBufReader::available_items_iter`].
 pub(crate) struct ReaderIterator<'a, 'b, T: CBufItem, const SIZE: usize>
 where
     'a: 'b,

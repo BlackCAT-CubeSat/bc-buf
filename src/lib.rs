@@ -2,11 +2,28 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Nonblocking single-writer, multiple-reader,
-//! zero-or-one-allocation circular buffers
+//! possibly-zero-allocation circular buffers
 //! for sharing data across threads and processes
 //! (with possible misses by readers).
+//!
+//! [`CBuf<T, SIZE>`] is the structure holding a circular buffer itself.
+//! A single [`CBufWriter<T, SIZE>`] is used to add items to the (logical)
+//! end of a buffer, and one or more [`CBufReader<T, SIZE>`]s are used to
+//! (fallibly) read items from the buffer. [`CBuf`]s start out
+//! conceptually empty; once `SIZE-1` items have been added, the
+//! buffer is full, and the later addition of an item will (conceptually)
+//! overwrite the oldest item in the buffer (the actual details are
+//! slightly different but appear like this externally).
+//!
+//! A [`CBufIndex<SIZE>`] can be used to address items inside a buffer
+//! (and one is used internally by a [`CBufReader`] to implement sequential
+//! reads). A [`CBufIndex`] can become stale if enough additional items are
+//! written to the buffer; staleness is detected with high probability
+//! (~(2<sup>[`usize::BITS`]</sup>&nbsp;&minus;&nbsp;`SIZE`)&nbsp;/&nbsp;2<sup>[`usize::BITS`]</sup>
+//! in the most general case, and higher in typical envisioned cases).
 
 #![no_std]
+#![warn(missing_docs)]
 
 #[cfg(test)]
 extern crate std;
@@ -21,34 +38,67 @@ use core::ops::Range;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
 
-/// A convenience trait for possible items
-/// read from and written to a circular buffer.
+/// A convenience trait for the constraints on the possible types
+/// that can be stored in [`CBuf`]s.
 pub trait CBufItem: Sized + Copy + Send + 'static {}
 
 /// Blanket implementation for all eligible types.
 impl<T> CBufItem for T where T: Sized + Copy + Send + 'static {}
 
-#[repr(C)]
+/// A circular buffer of `T`s which can store up to `SIZE-1` elements at a time.
+///
+/// The constant parameter `SIZE` must be a power of two that is greater than 1;
+/// trying to use other values for `SIZE` will result in a compile-time panic.
 pub struct CBuf<T: CBufItem, const SIZE: usize> {
     buf:  [T; SIZE],
     next: AtomicIndex<SIZE>,
 }
 
+/// A consumer of elements from a `&'a `[`CBuf<T, SIZE>`], or
+/// a [`[T; SIZE]`](array) and [`AtomicUsize`] being used with
+/// the same semantics as a [`CBuf<T, SIZE>`].
+///
+/// There may be many readers for a given [`CBuf`].
+///
+/// Items may be read from the circular buffer sequentially
+/// using [`fetch_next_item`](Self::fetch_next_item)
+/// (or the iterator returned by [`available_items_iter`](Self::available_items_iter),
+/// which repeatedly calls [`fetch_next_item`](Self::fetch_next_item)),
+/// or may be fetched by index using [`fetch`](Self::fetch).
+///
+/// Both sequential and indexed reads are fallible:
+/// if too many elements have been written to the circular buffer by the [`CBufWriter`],
+/// the [`CBufIndex<SIZE>`] used for [`fetch`](Self::fetch) (or used interally by
+/// the [`CBufReader`] in [`fetch_next_item`](Self::fetch_next_item)) may become out-of-date, with
+/// a newer element in place of the element referred to by the index.
 pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
+    /// Pointer to the [`CBuf`]'s backing array.
     buf:        *const T,
+    /// Reference to the [`CBuf`]'s buffer state.
     next_ref:   &'a AtomicIndex<SIZE>,
+    /// The index of the next index to read from, when reading sequentially.
     next_local: CBufIndex<SIZE>,
 }
 
+/// An inserter of elements into a `&'a mut `[`CBuf<T, SIZE>`], or
+/// a [`[T; SIZE]`](array) and [`AtomicUsize`] being used with
+/// the same semantics as a [`CBuf<T, SIZE>`].
+///
+/// There **must** be at most one writer for a given [`CBuf`] at any given time.
+///
+/// Items are inserted into the circular buffer using [`add_item`](Self::add_item).
 pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
+    /// Pointer to the [`CBuf`]'s backing array.
     buf:        *mut T,
+    /// Reference to the [`CBuf`]'s buffer state.
     next_ref:   &'a AtomicIndex<SIZE>,
+    /// The index of the next index to write to.
     next_local: CBufIndex<SIZE>,
 }
 
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     /// If `SIZE` is a power of two that's greater than 1 and less than
-    /// 2<sup>[`usize::BITS`]`-1`</sup>, as it should be, this is just `true`;
+    /// 2<sup>[`usize::BITS`]</sup>, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
     const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE > 1 {
         true
@@ -56,8 +106,19 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         panic!("SIZE param of some CBuf is *not* an allowed value")
     };
 
+    /// Constant AND'ed with the value of [`Self::next`] to obtain
+    /// the index in [`Self::buf`] at which the next item should be written.
     const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
 
+    /// Constructs a new, logically-empty [`CBuf<T, SIZE>`].
+    ///
+    /// `filler_item` is only used to initialize the buffer's storage; it will
+    /// not be returned by [`CBufReader<T, SIZE>`] or [`CBufWriter<T, SIZE>`] accessor methods.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub const fn new(filler_item: T) -> Self {
         let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 1 };
@@ -68,6 +129,21 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         }
     }
 
+    /// Given a pointer `p` to a possibly-uninitialized [`CBuf<T, SIZE>`],
+    /// initializes it in a logically-empty state, using
+    /// `filler_item` to ensure the buffer memory has been initialized.
+    ///
+    /// If `p` is null, nothing is done.
+    ///
+    /// # Safety
+    ///
+    /// `p` must be a properly-aligned pointer; undefined behavior occurs
+    /// otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub unsafe fn initialize(p: *mut Self, filler_item: T) {
         use core::ptr::addr_of_mut;
@@ -83,6 +159,7 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         fence(SeqCst);
     }
 
+    /// Returns a [`CBufWriter`] for adding elements to `self`.
     #[inline]
     pub fn as_writer<'a>(&'a mut self) -> CBufWriter<'a, T, SIZE> {
         CBufWriter {
@@ -92,11 +169,29 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         }
     }
 
+    /// Returns a pointer to the start of the backing array (of length `SIZE`)
+    /// and a pointer to the circular-buffer state (stored in an [`AtomicUsize`]).
+    ///
+    /// Assuming `T` has a [layout] that is stable across compilations
+    /// (e.g., `T` is `#[repr(C)]` and only has members with stable layouts),
+    /// the return values can be transferred to separately-compiled code, which
+    /// can pass the pointers to [`CBufReader::new_from_ptr`] and construct a [`CBufReader<T, SIZE>`].
+    ///
+    /// [layout]: https://doc.rust-lang.org/reference/type-layout.html
     #[inline]
     pub const fn as_ptrs(&self) -> (*const T, *const AtomicUsize) {
         (self.buf.as_ptr(), &self.next.n)
     }
 
+    /// Returns a mutable pointer to the start of the backing array (of length `SIZE`)
+    /// and a pointer to the circular-buffer state (stored in an [`AtomicUsize`]).
+    ///
+    /// Assuming `T` has a [layout] that is stable across compilations
+    /// (e.g., `T` is `#[repr(C)]` and only has members with stable layouts),
+    /// the return values can be transferred to separately-compiled code, which
+    /// can pass the pointers to [`CBufWriter::new_from_ptr`] and construct a [`CBufWriter<T, SIZE>`].
+    ///
+    /// [layout]: https://doc.rust-lang.org/reference/type-layout.html
     #[inline]
     pub fn as_mut_ptrs(&mut self) -> (*mut T, *const AtomicUsize) {
         (self.buf.as_mut_ptr(), &self.next.n)
@@ -104,11 +199,13 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
 }
 
 impl<T: CBufItem + Default, const SIZE: usize> CBuf<T, SIZE> {
+    /// A shortcut for [`CBuf::new`]`(`[`T::default`](Default::default)`())`.
     #[inline]
     pub fn new_with_default() -> Self {
         Self::new(T::default())
     }
 
+    /// A shortcut for [`CBuf::initialize`]`(`[`T::default`](Default::default)`())`.
     #[inline]
     pub unsafe fn initialize_with_default(p: *mut Self) {
         Self::initialize(p, T::default());
@@ -121,6 +218,27 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
     const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
 
+    /// Creates a new [`CBufWriter<T, SIZE>`]
+    /// from `buf`, a pointer to the start of the `SIZE`-element array storing a [`CBuf<T, SIZE>`]'s items,
+    /// and `next_idx`, a pointer to the [`CBuf`]'s buffer state,
+    /// assuming they are non-null.
+    ///
+    /// Returns `None` if `buf` or `next_idx` is null.
+    ///
+    /// # Safety
+    ///
+    /// `buf` and `next_idx` must be properly aligned.
+    ///
+    /// The programmer must ensure that the pointees of `buf` and `next_idx` outlive
+    /// the returned [`CBufWriter<T, SIZE>`].
+    ///
+    /// At any given time, there **must** be at most one [`CBufWriter`] for a given circular buffer.
+    /// This is not enforced by this function&mdash;the programmer must ensure this is the case.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub unsafe fn new_from_ptr(buf: *mut T, next_idx: *const AtomicUsize) -> Option<Self> {
         if !Self::IS_SIZE_OK || buf.is_null() || next_idx.is_null()
@@ -137,11 +255,19 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         })
     }
 
+    /// Inserts `item` as the newest item in the associated circular buffer.
+    ///
+    /// If the buffer is full (contains `SIZE-1` items), the oldest item
+    /// is implicitly removed from the buffer.
     #[inline(always)]
     pub fn add_item(&mut self, item: T) {
         self.add_item_seq(item, &());
     }
 
+    /// The backing logic for [`add_item`](Self::add_item).
+    ///
+    /// Tests in this crate can use non-[`()`] [`Sequencer`] implementors
+    /// to control concurrency between this [`CBufWriter`] and [`CBufReader`]s.
     #[inline]
     pub(crate) fn add_item_seq<S: Sequencer<WriteProtocolStep>>(&mut self, item: T, seq: &S) {
         macro_rules! wrap_atomic {
@@ -165,6 +291,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
         self.next_local = next_next;
     }
 
+    /// Returns an iterator into the circular buffer's currently-stored items.
     #[inline]
     pub fn current_items_iter<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a>
     where
@@ -185,8 +312,31 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
     const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
 
-    const NUM_READ_TRIES: u32 = 16;
+    /// The maximum number of times [`fetch_next_item`](Self::fetch_next_item)
+    /// will try to fetch an item from the circular buffer
+    /// before giving up and returning [`ReadResult::SpinFail`].
+    pub const NUM_READ_TRIES: u32 = 16;
 
+    /// Creates a new [`CBufReader<T, SIZE>`]
+    /// from `buf`, a pointer to the start of the `SIZE`-element array storing a [`CBuf<T, SIZE>`]'s items,
+    /// and `next_idx`, a pointer to the [`CBuf`]'s buffer state,
+    /// assuming they are non-null.
+    ///
+    /// Returns `None` if `buf` or `next_idx` is null.
+    ///
+    /// # Safety
+    ///
+    /// `buf` and `next_idx` must be properly aligned.
+    ///
+    /// The programmer must ensure that the pointees of `buf` and `next_idx` outlive
+    /// the returned [`CBufReader<T, SIZE>`].
+    ///
+    /// Unlike with [`CBufWriter`], there may be multiple [`CBufReader`]s for a given circular buffer.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub unsafe fn new_from_ptr(buf: *const T, next_idx: *const AtomicUsize) -> Option<Self> {
         if !Self::IS_SIZE_OK || buf.is_null() || next_idx.is_null()
@@ -203,11 +353,35 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         })
     }
 
+    /// Tries to fetch the item in the buffer immediately after the one fetched by
+    /// the previous call to [`fetch_next_item`](Self::fetch_next_item). If successful,
+    /// [`ReadResult::Success`] is returned, with the item in question as its payload.
+    ///
+    /// There are a few possible ways trying to fetch the next item can
+    /// fail:
+    ///
+    /// * There may not be a next item, if the previously-fetched item was
+    ///   the last one that's been added to the buffer. In this case,
+    ///   [`ReadResult::None`] is returned.
+    /// * Enough items have been added since the previously-fetched item that
+    ///   the intended next item has already been overwritten. In this case,
+    ///   [`ReadResult::Skipped`] is returned with a payload of either the
+    ///   oldest valid item in the buffer (if `fast_forward` is `false`) or
+    ///   the newest item in the buffer (if `fast_forward` is `true`).
+    /// * If the [`CBufWriter`] is adding new items to the buffer while `fetch_next_item`
+    ///   is trying to read, it's possible the read attempt will get clobbered.
+    ///   If [`NUM_READ_TRIES`](Self::NUM_READ_TRIES) attempts to read occur and they all get clobbered
+    ///   by the writer, [`ReadResult::SpinFail`] is returned.
     #[inline(always)]
     pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
         self.fetch_next_item_seq(fast_forward, &())
     }
 
+    /// The backing logic for [`fetch_next_item`](Self::fetch_next_item).
+    ///
+    /// Tests in this crate can use non-[`()`] [`Sequencer`] implementors
+    /// to control concurrency between this [`CBufReader`]
+    /// and the [`CBufWriter`] and any other [`CBufReader`]s.
     #[inline]
     pub(crate) fn fetch_next_item_seq<S>(&mut self, fast_forward: bool, seq: &S) -> ReadResult<T>
     where
@@ -262,6 +436,9 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
                 send_and_return!(RR::None);
             }
 
+            // if the CBuf's `next`, while we read `item` from the array,
+            // stayed with the range such that `item` was not written to _and_
+            // had not been previously overwritten by a newer value:
             if next_0.is_in_range(next_next, SIZE - 1) && next_1.is_in_range(next_next, SIZE - 1) {
                 self.next_local = next_next;
                 send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
@@ -285,6 +462,11 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         send_and_return!(RR::SpinFail);
     }
 
+    /// Returns an iterator that calls [`fetch_next_item`](Self::fetch_next_item) repeatedly
+    /// until we reach the last-written item in the buffer.
+    ///
+    /// `fast_forward` is used as the `fast_forward` argument to calls to
+    /// [`fetch_next_item`](Self::fetch_next_item).
     #[inline]
     pub fn available_items_iter<'b>(
         &'b mut self,
@@ -300,16 +482,24 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         }
     }
 
+    /// Resets the [`CBufReader`]'s internal current index
+    /// (as used by [`fetch_next_item`](Self::fetch_next_item)
+    /// and returned by [`current_next_index`](Self::current_next_index))
+    /// to just past the last-written item in the buffer.
     #[inline]
     pub fn fast_forward(&mut self) {
         self.next_local = self.next_ref.load(SeqCst);
     }
 
+    /// Returns the current value of the index used for sequential reads
+    /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
+    /// and [`available_items_iter`](Self::available_items_iter)).
     #[inline]
     pub fn current_next_index(&self) -> CBufIndex<SIZE> {
         self.next_local
     }
 
+    /// Returns the half-open range of valid indexes for items currently in the circular buffer.
     #[inline]
     pub fn current_valid_index_range(&self) -> Range<CBufIndex<SIZE>> {
         let next = self.next_ref.load(SeqCst);
@@ -319,8 +509,13 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         }
     }
 
+    /// Tries to read the item at index `idx` in the buffer.
+    ///
+    /// If successful, returns the item;
+    /// if not (see [`fetch_next_item`](Self::fetch_next_item) for possible failure modes),
+    /// returns an [`InvalidIndexError`].
     #[inline]
-    pub fn fetch(&self, idx: CBufIndex<SIZE>) -> Result<T, OutOfBoundsError> {
+    pub fn fetch(&self, idx: CBufIndex<SIZE>) -> Result<T, InvalidIndexError> {
         let next_0 = self.next_ref.load(SeqCst);
         fence(SeqCst);
         let item = unsafe { read_volatile(self.buf.add(idx.as_usize() & Self::IDX_MASK)) };
@@ -330,20 +525,13 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         if next_0.is_in_range(idx, SIZE - 1) && next_1.is_in_range(idx, SIZE - 1) {
             Ok(item)
         } else {
-            Err(OutOfBoundsError(()))
+            Err(InvalidIndexError(()))
         }
     }
 }
 
-pub struct OutOfBoundsError(());
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum WriteProtocolStep {
-    PreWrite,
-    BufferWrite,
-    IndexPostUpdate,
-}
-
+/// The return value of [`CBufReader::fetch_next_item`]
+/// and of the iterator returned by [`CBufReader::available_items_iter`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ReadResult<T> {
     /// Normal case; fetched next item.
@@ -352,10 +540,27 @@ pub enum ReadResult<T> {
     Skipped(T),
     /// No new items are available.
     None,
-    /// After trying a number of times, not able to read.
+    /// After trying [`CBufReader::NUM_READ_TRIES`] times, not able to successfully read an item.
     SpinFail,
 }
 
+/// Signifies that the index used in [`CBufReader::fetch`] is not valid.
+pub struct InvalidIndexError(());
+
+/// One of the atomic steps in the protocol used by
+/// [`CBufWriter::add_item_seq`] to add an item to a buffer.
+///
+/// Also, one of the checkpoints a [`Sequencer`] may stop at within
+/// [`CBufWriter::add_item_seq`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteProtocolStep {
+    PreWrite,
+    BufferWrite,
+    IndexPostUpdate,
+}
+
+/// One of the atomic steps in the protocol used by
+/// [`CBufReader::fetch_next_item_seq`] to fetch an item from a buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ReadProtocolStep {
     IndexCheckPre,
@@ -363,6 +568,8 @@ pub(crate) enum ReadProtocolStep {
     IndexCheckPost,
 }
 
+/// One of the checkpoints a [`Sequencer`] may stop at within
+/// [`CBufReader::fetch_next_item_seq`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum FetchCheckpoint<T> {
     Step(ReadProtocolStep),

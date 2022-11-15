@@ -1,15 +1,47 @@
 // Copyright (c) 2022 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//!
+//! Utility types used in conjunction with [`CBuf`]s and their readers and writers.
 
 use super::CBuf;
+#[cfg(doc)]
+use super::{CBufReader, CBufWriter};
 
 use core::ops::{Add, AddAssign, Range, Sub, SubAssign};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 use std::sync::mpsc;
+
+/// An index into a [`CBuf<T, SIZE>`].
+///
+/// This type is distinguished from a simple [`usize`] by using the high-order bits
+/// to (1) record whether the buffer is full or not and (2) determine (with high probability)
+/// whether or not the writer has looped around the buffer since the index was generated,
+/// allowing us to determine whether the index is still valid.
+/// This type is used internally by [`CBuf`], [`CBufReader`], and [`CBufWriter`];
+/// it can also be used by users through, e.g., [`CBufReader::fetch`].
+
+// The exact semantics of a CBufIndex<SIZE> are that it's a usize that wraps around to SIZE
+// rather than 0.
+//
+// For the given values idx of the .next.idx field of a CBuf<T, SIZE> (call it cb):
+//
+// idx < SIZE:
+//   * the CBuf is not completely full
+//   * valid indices for items in the buffer are in the interval (-Inf, idx)
+//   * the next item will be written to cb.buf[idx]
+//   * once the next item has been written, the next value of idx will be idx + 1
+// SIZE <= idx < 2*SIZE-1:
+//   * the CBuf is completely full
+//   * valid indices for items in the buffer are in the intervals [idx-SIZE+1, idx) and [(usize::MAX-SIZE+1) + (idx-SIZE+1), usize::MAX]
+//   * the next item will be written to cb.buf[idx & (SIZE-1)]
+//   * once the next item has been written, the next value of idx will be idx+1
+// 2*SIZE-1 <= idx:
+//   * the CBuf is completely full
+//   * valid indices for items in the buffer are in the interval [idx-SIZE+1, idx)
+//   * the next item will be written to cb.buf[idx & (SIZE-1)]
+//   * once the next item has been written, the next value of cb.next will be max(idx.wrapping_add(1), SIZE)
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CBufIndex<const SIZE: usize> {
@@ -19,6 +51,12 @@ pub struct CBufIndex<const SIZE: usize> {
 impl<const SIZE: usize> CBufIndex<SIZE> {
     const IS_SIZE_OK: bool = CBuf::<(), SIZE>::IS_SIZE_OK;
 
+    /// Returns `raw_val` as a [`CBufIndex<SIZE>`].
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid size for a [`CBuf`] (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub const fn new(raw_val: usize) -> Self {
         if !Self::IS_SIZE_OK {
@@ -28,8 +66,9 @@ impl<const SIZE: usize> CBufIndex<SIZE> {
         Self { idx: raw_val }
     }
 
-    pub const ZERO: Self = Self::new(0);
+    pub(crate) const ZERO: Self = Self::new(0);
 
+    /// Returns `self` represented as a [`usize`].
     #[inline]
     pub const fn as_usize(self) -> usize {
         self.idx
@@ -43,6 +82,7 @@ impl<const SIZE: usize> Default for CBufIndex<SIZE> {
     }
 }
 
+/// Adding a `usize` `inc` to `CBufIndex<SIZE>` `self` yields the index `inc` after `self`.
 impl<const SIZE: usize> Add<usize> for CBufIndex<SIZE> {
     type Output = Self;
 
@@ -72,6 +112,9 @@ impl<const SIZE: usize> AddAssign<usize> for CBufIndex<SIZE> {
     }
 }
 
+/// Subtracting a `usize` `dec` from `CBufIndex<SIZE>` `self` yields one of
+/// the indices `i` such that `i + dec == self`; where there are two such `i`,
+/// we select the one that is in the looping part of the range (`[SIZE, usize::MAX]`).
 impl<const SIZE: usize> Sub<usize> for CBufIndex<SIZE> {
     type Output = Self;
 
@@ -97,6 +140,8 @@ impl<const SIZE: usize> Sub<usize> for CBufIndex<SIZE> {
     }
 }
 
+/// Subtracting a `CBufIndex<SIZE>` `other` from `CBufIndex<SIZE>` `self` yields
+/// the least `usize` `i` such that `other + i == self`, if such a `usize` exists.
 impl<const SIZE: usize> Sub<CBufIndex<SIZE>> for CBufIndex<SIZE> {
     type Output = Option<usize>;
 
@@ -119,8 +164,11 @@ impl<const SIZE: usize> SubAssign<usize> for CBufIndex<SIZE> {
 }
 
 impl<const SIZE: usize> CBufIndex<SIZE> {
+    /// The length of the looping part of the index range
+    /// (i.e., [SIZE, usize::MAX]).
     const LOOP_LENGTH: usize = usize::MAX - SIZE + 1;
 
+    /// Determines if `self == base + i` for some `i < len`.
     #[inline]
     pub fn is_in_range(self, base: Self, len: usize) -> bool {
         if !Self::IS_SIZE_OK {
@@ -146,7 +194,18 @@ impl<const SIZE: usize> CBufIndex<SIZE> {
     }
 }
 
+/// An interface for splitting an object into two smaller parts.
+///
+/// Certain types have some concept of having subsets: a [`Range`] can
+/// have sub-ranges, a slice can have sub-slices, etc. This trait
+/// is an abstraction of the idea of splitting an object (when possible)
+/// into two objects of the same type that form a partition of the original.
 pub trait Bisect: Sized {
+    /// If `self` can be divided into smaller parts of the same type,
+    /// returns two objects that form a partition of the original.
+    ///
+    /// Ideally, if a non-`None` value is returned, and the type has
+    /// some concept of size, the returned objects should be roughly the same size.
     fn bisect(&self) -> Option<(Self, Self)>;
 }
 
@@ -176,22 +235,35 @@ impl<const SIZE: usize> Bisect for Range<CBufIndex<SIZE>> {
     }
 }
 
+/// A wrapper around an [`AtomicUsize`] to make it look like
+/// a [`CBufIndex<SIZE>`] with atomic loads and stores.
 #[repr(transparent)]
 pub(crate) struct AtomicIndex<const SIZE: usize> {
     pub(crate) n: AtomicUsize,
 }
 
 impl<const SIZE: usize> AtomicIndex<SIZE> {
+    /// Creates a new [`AtomicIndex<SIZE>`] with initial value `n`.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid size for a [`CBuf`] (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub(crate) const fn new(n: usize) -> Self {
+        if !CBuf::<(), SIZE>::IS_SIZE_OK {
+            return Self { n: AtomicUsize::new(0) };
+        }
         Self { n: AtomicUsize::new(n) }
     }
 
+    /// Atomically fetches the value of `*self`.
     #[inline]
     pub(crate) fn load(&self, order: Ordering) -> CBufIndex<SIZE> {
         CBufIndex { idx: self.n.load(order) }
     }
 
+    /// Atomically stores the value of `idx` to `*self`.
     #[inline]
     pub(crate) fn store(&self, idx: CBufIndex<SIZE>, order: Ordering) {
         self.n.store(idx.idx, order);
@@ -201,12 +273,16 @@ impl<const SIZE: usize> AtomicIndex<SIZE> {
 /// Used in multithreaded tests for reproducible sequencing of events
 /// and reporting of results.
 pub(crate) trait Sequencer<T: Send> {
+    /// Halts until instructed to proceed.
     fn wait_for_go_ahead(&self);
 
+    /// Sends a value to the user of the [`Sequencer<T>`].
+    /// `send_result` should be called exactly once after each call to [`Self::wait_for_go_ahead`]
+    /// _and at no other time_.
     fn send_result(&self, result: T);
 }
 
-/// A null implementation for use everywhere except tests.
+/// A null implementation of [`Sequencer<T>`] for use everywhere except tests.
 impl<T: Send> Sequencer<T> for () {
     #[inline(always)]
     fn wait_for_go_ahead(&self) {}
@@ -215,6 +291,9 @@ impl<T: Send> Sequencer<T> for () {
     fn send_result(&self, _result: T) {}
 }
 
+/// An implementor of [`Sequencer<T>`] for use in tests.
+///
+/// Uses channels behind the scenes.
 #[cfg(test)]
 pub(crate) struct TestSequencer<T: Send> {
     rcv_chan:  mpsc::Receiver<()>,
@@ -223,6 +302,11 @@ pub(crate) struct TestSequencer<T: Send> {
 
 #[cfg(test)]
 impl<T: Send> TestSequencer<T> {
+    /// Creates a new [`TestSequencer<T>`], as well as
+    /// a [`mpsc::Sender`] to allow the user of the [`TestSequencer`]
+    /// to proceed through a checkpoint
+    /// and a [`mpsc::Receiver`] to fetch the value resulting
+    /// from the checkpoint.
     pub(crate) fn new() -> (Self, (mpsc::Sender<()>, mpsc::Receiver<T>)) {
         let (snd0, rcv0) = mpsc::channel::<()>();
         let (snd1, rcv1) = mpsc::channel::<T>();
