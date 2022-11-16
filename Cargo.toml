@@ -1,7 +1,7 @@
 [package]
-name = "bc-structs"
+name = "bc-buf"
 version = "0.0.0"
-description = "Miscellaneous structures useful in flight software"
+description = "A non-blocking single-writer/multiple-reader circular buffer"
 license = "MIT OR Apache-2.0"
 edition = "2021"
 
