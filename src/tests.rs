@@ -896,6 +896,191 @@ fn mini_model_interference_1w1r_ff() {
             }
         },
     );
+}
 
-    //std::panic!("HA! HA! I'm using the Internet!!1");
+#[test]
+fn fetch_model_no_interference() {
+    use FetchCheckpoint as FC;
+    use TraceStep as TS;
+
+    for (index, value) in [(0x15, 5), (0x17, 7), (0x20, 0), (0x22, 2)] {
+        iterate_over_event_sequences(
+            &|| CBuf {
+                buf:  iota::<16>(),
+                next: AtomicIndex::new(0x23),
+            },
+            &|reader, sequencer| {
+                spawn(move || {
+                    let _ = reader.fetch_seq(CBufIndex::new(index), &sequencer);
+                })
+            },
+            0,
+            &|mut writer, sequencer| {
+                spawn(move || {
+                    writer.add_item_seq(42, &sequencer);
+                })
+            },
+            &mut |trace| {
+                std::eprintln!("testing {:?}", trace);
+
+                // something should have happened:
+                assert!(trace.len() > 0);
+
+                // the writer should proceed through the entire write protocol:
+                assert_eq!(trace.iter().filter(|t| matches!(*t, TS::Writer(_))).count(), 3);
+
+                // the reader should proceed through the entire read protocol exactly once:
+                assert_eq!(
+                    trace.iter().filter(|t| matches!(*t, TS::Reader(FC::Step(_)))).count(),
+                    3
+                );
+
+                // there should be only one return from fetch_seq(),
+                // and it should be Ok(value):
+                let returns: Vec<_> = trace
+                    .iter()
+                    .filter_map(|t| {
+                        if let TS::Reader(FC::ReturnVal(rv)) = *t {
+                            Some(rv)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(returns.len(), 1);
+                assert_eq!(returns[0], Ok(value));
+            },
+        );
+    }
+}
+
+#[test]
+fn fetch_model_definite_interference() {
+    use FetchCheckpoint as FC;
+    use TraceStep as TS;
+
+    iterate_over_event_sequences(
+        &|| CBuf {
+            buf:  iota::<16>(),
+            next: AtomicIndex::new(0x23),
+        },
+        &|reader, sequencer| {
+            spawn(move || {
+                let _ = reader.fetch_seq(CBufIndex::new(0x13), &sequencer);
+            })
+        },
+        0,
+        &|mut writer, sequencer| {
+            spawn(move || {
+                writer.add_item_seq(42, &sequencer);
+            })
+        },
+        &mut |trace| {
+            std::eprintln!("testing {:?}", trace);
+
+            // something should have happened:
+            assert!(trace.len() > 0);
+
+            // the writer should proceed through the entire write protocol:
+            assert_eq!(trace.iter().filter(|t| matches!(*t, TS::Writer(_))).count(), 3);
+
+            // the reader should proceed through the entire read protocol exactly once:
+            assert_eq!(trace.iter().filter(|t| matches!(*t, TS::Reader(FC::Step(_)))).count(), 3);
+
+            // there should be only one return from fetch_seq(),
+            // and it should be Err:
+            let returns: Vec<_> =
+                trace
+                    .iter()
+                    .filter_map(|t| {
+                        if let TS::Reader(FC::ReturnVal(rv)) = *t {
+                            Some(rv)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            assert_eq!(returns.len(), 1);
+            assert!(matches!(returns[0], Err(_)));
+        },
+    );
+}
+
+#[test]
+fn fetch_model_possible_interference() {
+    use FetchCheckpoint as FC;
+    use ReadProtocolStep as RPS;
+    use TraceStep as TS;
+    use WriteProtocolStep as WPS;
+
+    let (mut trace_err, mut trace_ok) = (false, false);
+
+    iterate_over_event_sequences(
+        &|| CBuf {
+            buf:  iota::<16>(),
+            next: AtomicIndex::new(0x23),
+        },
+        &|reader, sequencer| {
+            spawn(move || {
+                let _ = reader.fetch_seq(CBufIndex::new(0x14), &sequencer);
+            })
+        },
+        0,
+        &|mut writer, sequencer| {
+            spawn(move || {
+                writer.add_item_seq(42, &sequencer);
+            })
+        },
+        &mut |trace| {
+            std::eprintln!("testing {:?}", trace);
+
+            // something should have happened:
+            assert!(trace.len() > 0);
+
+            // the writer should proceed through the entire write protocol:
+            assert_eq!(trace.iter().filter(|t| matches!(*t, TS::Writer(_))).count(), 3);
+
+            // the reader should proceed through the entire read protocol exactly once:
+            assert_eq!(trace.iter().filter(|t| matches!(*t, TS::Reader(FC::Step(_)))).count(), 3);
+
+            // there should be only one return from fetch_seq(),
+            // and it should be either Ok(4) or Err:
+            let returns: Vec<_> =
+                trace
+                    .iter()
+                    .filter_map(|t| {
+                        if let TS::Reader(FC::ReturnVal(rv)) = *t {
+                            Some(rv)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            assert_eq!(returns.len(), 1);
+            assert!(matches!(returns[0], Ok(4) | Err(_)));
+
+            trace_ok |= matches!(returns[0], Ok(_));
+            trace_err |= matches!(returns[0], Err(_));
+
+            for (i, t) in trace.iter().enumerate() {
+                // if, before IndexCheckPost,
+                // an IndexPostUpdate occurs, the reader should return Err; otherwise,
+                // it should return Ok.
+                if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) {
+                    let update_before_check =
+                        prev_with_pat!(trace, i, TS::Writer(WPS::IndexPostUpdate)).is_some();
+
+                    if update_before_check {
+                        assert!(matches!(returns[0], Err(_)));
+                    } else {
+                        assert_eq!(returns[0], Ok(4));
+                    }
+                }
+            }
+        },
+    );
+
+    // some trace should to fetch a value, and some trace should succeeded:
+    assert!(trace_err);
+    assert!(trace_ok);
 }

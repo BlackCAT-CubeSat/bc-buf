@@ -558,11 +558,20 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         };
         let next_1 = wrap_atomic! { IndexCheckPost, self.next_ref.load(SeqCst) };
 
-        let retval = if next_0.is_in_range(idx, SIZE - 1) && next_1.is_in_range(idx, SIZE - 1) {
-            Ok(item)
-        } else {
-            Err(InvalidIndexError(()))
-        };
+        #[cfg(test)]
+        std::eprintln!(
+            "idx: {:02x}    next_0: {:02x}    next_1: {:02x}",
+            idx.as_usize(),
+            next_0.as_usize(),
+            next_1.as_usize(),
+        );
+
+        let retval =
+            if next_0.is_in_range(idx + 1, SIZE - 1) && next_1.is_in_range(idx + 1, SIZE - 1) {
+                Ok(item)
+            } else {
+                Err(InvalidIndexError(()))
+            };
 
         seq.wait_for_go_ahead();
         seq.send_result(FetchCheckpoint::ReturnVal(retval));
@@ -585,7 +594,7 @@ pub enum ReadResult<T> {
 }
 
 /// Signifies that the index used in [`CBufReader::fetch`] is not valid.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidIndexError(());
 
 /// One of the atomic steps in the protocol used by
