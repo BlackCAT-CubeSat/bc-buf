@@ -2,59 +2,155 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Nonblocking single-writer, multiple-reader,
-//! zero-or-one-allocation circular buffers
+//! possibly-zero-allocation circular buffers
 //! for sharing data across threads and processes
 //! (with possible misses by readers).
+//!
+//! [`CBuf<T, SIZE>`] is the structure holding a circular buffer itself.
+//! A single [`CBufWriter<T, SIZE>`] is used to add items to the (logical)
+//! end of a buffer, and one or more [`CBufReader<T, SIZE>`]s are used to
+//! (fallibly) read items from the buffer. [`CBuf`]s start out
+//! conceptually empty; once `SIZE-1` items have been added, the
+//! buffer is full, and the later addition of an item will (conceptually)
+//! overwrite the oldest item in the buffer (the actual details are
+//! slightly different but appear like this externally).
+//!
+//! A [`CBufIndex<SIZE>`] can be used to address items inside a buffer
+//! (and one is used internally by a [`CBufReader`] to implement sequential
+//! reads). A [`CBufIndex`] can become stale if enough additional items are
+//! written to the buffer; staleness is detected with high probability
+//! (~(2<sup>[`usize::BITS`]</sup>&nbsp;&minus;&nbsp;`SIZE`)&nbsp;/&nbsp;2<sup>[`usize::BITS`]</sup>
+//! in the most general case, and higher in typical envisioned cases).
 
 #![no_std]
+#![warn(missing_docs)]
 
 #[cfg(test)]
 extern crate std;
 
-pub(crate) mod utils;
 pub(crate) mod iter;
+pub(crate) mod utils;
 
-use core::sync::atomic::{fence, Ordering::SeqCst};
+use crate::utils::{AtomicIndex, Sequencer};
+pub use crate::utils::{Bisect, CBufIndex};
+
+use core::ops::Range;
 use core::ptr::{read_volatile, write_volatile};
-use crate::utils::{BufIndex, Sequencer, AtomicIndex};
+use core::sync::atomic::{fence, AtomicUsize, Ordering::SeqCst};
 
-/// A convenience trait for possible items
-/// read from and written to a circular buffer.
+/// A convenience trait for the constraints on the possible types
+/// that can be stored in [`CBuf`]s.
 pub trait CBufItem: Sized + Copy + Send + 'static {}
 
 /// Blanket implementation for all eligible types.
 impl<T> CBufItem for T where T: Sized + Copy + Send + 'static {}
 
-#[repr(C)]
+/// A circular buffer of `T`s which can store up to `SIZE-1` elements at a time.
+///
+/// The constant parameter `SIZE` must be a power of two that is greater than 1;
+/// trying to use other values for `SIZE` will result in a compile-time panic.
 pub struct CBuf<T: CBufItem, const SIZE: usize> {
-    buf: [T; SIZE],
+    buf:  [T; SIZE],
     next: AtomicIndex<SIZE>,
+}
+
+/// A consumer of elements from a `&'a `[`CBuf<T, SIZE>`], or
+/// a [`[T; SIZE]`](array) and [`AtomicUsize`] being used with
+/// the same semantics as a [`CBuf<T, SIZE>`].
+///
+/// There may be many readers for a given [`CBuf`].
+///
+/// Items may be read from the circular buffer sequentially
+/// using [`fetch_next_item`](Self::fetch_next_item)
+/// (or the iterator returned by [`available_items_iter`](Self::available_items_iter),
+/// which repeatedly calls [`fetch_next_item`](Self::fetch_next_item)),
+/// or may be fetched by index using [`fetch`](Self::fetch).
+///
+/// Both sequential and indexed reads are fallible:
+/// if too many elements have been written to the circular buffer by the [`CBufWriter`],
+/// the [`CBufIndex<SIZE>`] used for [`fetch`](Self::fetch) (or used interally by
+/// the [`CBufReader`] in [`fetch_next_item`](Self::fetch_next_item)) may become out-of-date, with
+/// a newer element in place of the element referred to by the index.
+pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
+    /// Pointer to the [`CBuf`]'s backing array.
+    buf:        *const T,
+    /// Reference to the [`CBuf`]'s buffer state.
+    next_ref:   &'a AtomicIndex<SIZE>,
+    /// The index of the next index to read from, when reading sequentially.
+    next_local: CBufIndex<SIZE>,
+}
+
+/// An inserter of elements into a `&'a mut `[`CBuf<T, SIZE>`], or
+/// a [`[T; SIZE]`](array) and [`AtomicUsize`] being used with
+/// the same semantics as a [`CBuf<T, SIZE>`].
+///
+/// There **must** be at most one writer for a given [`CBuf`] at any given time.
+///
+/// Items are inserted into the circular buffer using [`add_item`](Self::add_item).
+pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
+    /// Pointer to the [`CBuf`]'s backing array.
+    buf:        *mut T,
+    /// Reference to the [`CBuf`]'s buffer state.
+    next_ref:   &'a AtomicIndex<SIZE>,
+    /// The index of the next index to write to.
+    next_local: CBufIndex<SIZE>,
 }
 
 impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     /// If `SIZE` is a power of two that's greater than 1 and less than
-    /// 2<sup>[`usize::BITS`]`-1`</sup>, as it should be, this is just `true`;
+    /// 2<sup>[`usize::BITS`]</sup>, as it should be, this is just `true`;
     /// otherwise, this generates a compile-time panic.
-    const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE > 1 { true }
-    else { panic!("SIZE param of some CBuf is *not* an allowed value") };
+    const IS_SIZE_OK: bool = if SIZE.is_power_of_two() && SIZE > 1 {
+        true
+    } else {
+        panic!("SIZE param of some CBuf is *not* an allowed value")
+    };
 
+    /// Constant AND'ed with the value of [`Self::next`] to obtain
+    /// the index in [`Self::buf`] at which the next item should be written.
     const IDX_MASK: usize = if Self::IS_SIZE_OK { SIZE - 1 } else { 0 };
 
+    /// Constructs a new, logically-empty [`CBuf<T, SIZE>`].
+    ///
+    /// `filler_item` is only used to initialize the buffer's storage; it will
+    /// not be returned by [`CBufReader<T, SIZE>`] or [`CBufWriter<T, SIZE>`] accessor methods.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
-    pub fn new(filler_item: T) -> Self {
+    pub const fn new(filler_item: T) -> Self {
         let initial_next: usize = if Self::IS_SIZE_OK { 0 } else { 1 };
 
         CBuf {
-            buf: [filler_item; SIZE],
+            buf:  [filler_item; SIZE],
             next: AtomicIndex::new(initial_next),
         }
     }
 
+    /// Given a pointer `p` to a possibly-uninitialized [`CBuf<T, SIZE>`],
+    /// initializes it in a logically-empty state, using
+    /// `filler_item` to ensure the buffer memory has been initialized.
+    ///
+    /// If `p` is null, nothing is done.
+    ///
+    /// # Safety
+    ///
+    /// `p` must be a properly-aligned pointer; undefined behavior occurs
+    /// otherwise.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
     #[inline]
     pub unsafe fn initialize(p: *mut Self, filler_item: T) {
         use core::ptr::addr_of_mut;
 
-        if p.is_null() || !Self::IS_SIZE_OK { return; }
+        if p.is_null() || !Self::IS_SIZE_OK {
+            return;
+        }
 
         for i in 0..SIZE {
             write_volatile(addr_of_mut!((*p).buf[i]), filler_item);
@@ -63,59 +159,127 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
         fence(SeqCst);
     }
 
+    /// Returns a [`CBufWriter`] for adding elements to `self`.
     #[inline]
     pub fn as_writer<'a>(&'a mut self) -> CBufWriter<'a, T, SIZE> {
         CBufWriter {
-            next: self.next.load(SeqCst),
-            cbuf: self,
+            buf:        self.buf.as_mut_ptr(),
+            next_ref:   &self.next,
+            next_local: self.next.load(SeqCst),
         }
+    }
+
+    /// Returns a [`CBufReader`] for reading elements from `self`.
+    #[inline]
+    pub fn as_reader<'a>(&'a self) -> CBufReader<'a, T, SIZE> {
+        CBufReader {
+            buf:        self.buf.as_ptr(),
+            next_ref:   &self.next,
+            next_local: self.next.load(SeqCst),
+        }
+    }
+
+    /// Returns a pointer to the start of the backing array (of length `SIZE`)
+    /// and a pointer to the circular-buffer state (stored in an [`AtomicUsize`]).
+    ///
+    /// Assuming `T` has a [layout] that is stable across compilations
+    /// (e.g., `T` is `#[repr(C)]` and only has members with stable layouts),
+    /// the return values can be transferred to separately-compiled code, which
+    /// can pass the pointers to [`CBufReader::new_from_ptr`] and construct a [`CBufReader<T, SIZE>`].
+    ///
+    /// [layout]: https://doc.rust-lang.org/reference/type-layout.html
+    #[inline]
+    pub const fn as_ptrs(&self) -> (*const T, *const AtomicUsize) {
+        (self.buf.as_ptr(), &self.next.n)
+    }
+
+    /// Returns a mutable pointer to the start of the backing array (of length `SIZE`)
+    /// and a pointer to the circular-buffer state (stored in an [`AtomicUsize`]).
+    ///
+    /// Assuming `T` has a [layout] that is stable across compilations
+    /// (e.g., `T` is `#[repr(C)]` and only has members with stable layouts),
+    /// the return values can be transferred to separately-compiled code, which
+    /// can pass the pointers to [`CBufWriter::new_from_ptr`] and construct a [`CBufWriter<T, SIZE>`].
+    ///
+    /// [layout]: https://doc.rust-lang.org/reference/type-layout.html
+    #[inline]
+    pub fn as_mut_ptrs(&mut self) -> (*mut T, *const AtomicUsize) {
+        (self.buf.as_mut_ptr(), &self.next.n)
     }
 }
 
 impl<T: CBufItem + Default, const SIZE: usize> CBuf<T, SIZE> {
+    /// A shortcut for [`CBuf::new`]`(`[`T::default`](Default::default)`())`.
     #[inline]
     pub fn new_with_default() -> Self {
         Self::new(T::default())
     }
 
+    /// A shortcut for [`CBuf::initialize`]`(`[`T::default`](Default::default)`())`.
     #[inline]
     pub unsafe fn initialize_with_default(p: *mut Self) {
         Self::initialize(p, T::default());
     }
 }
 
-pub struct CBufWriter<'a, T: CBufItem, const SIZE: usize> {
-    cbuf: &'a mut CBuf<T, SIZE>,
-    next: BufIndex<SIZE>,
-}
-
-pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
-    cbuf: &'a CBuf<T, SIZE>,
-    next: BufIndex<SIZE>,
-}
+unsafe impl<'a, T: CBufItem, const SIZE: usize> Send for CBufWriter<'a, T, SIZE> {}
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
     const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
     const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
 
-    pub unsafe fn from_ptr_init(cbuf: *mut CBuf<T, SIZE>) -> Option<Self> {
-        if !Self::IS_SIZE_OK { return None; }
-        let cbuf: &'a mut CBuf<T, SIZE> = cbuf.as_mut()?;
+    /// Creates a new [`CBufWriter<T, SIZE>`]
+    /// from `buf`, a pointer to the start of the `SIZE`-element array storing a [`CBuf<T, SIZE>`]'s items,
+    /// and `next_idx`, a pointer to the [`CBuf`]'s buffer state,
+    /// assuming they are non-null.
+    ///
+    /// Returns `None` if `buf` or `next_idx` is null.
+    ///
+    /// # Safety
+    ///
+    /// `buf` and `next_idx` must be properly aligned.
+    ///
+    /// The programmer must ensure that the pointees of `buf` and `next_idx` outlive
+    /// the returned [`CBufWriter<T, SIZE>`].
+    ///
+    /// At any given time, there **must** be at most one [`CBufWriter`] for a given circular buffer.
+    /// This is not enforced by this function&mdash;the programmer must ensure this is the case.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
+    #[inline]
+    pub unsafe fn new_from_ptr(buf: *mut T, next_idx: *const AtomicUsize) -> Option<Self> {
+        if !Self::IS_SIZE_OK || buf.is_null() || next_idx.is_null()
+        /*|| !buf.is_aligned() || !next_idx.is_aligned()*/
+        {
+            return None;
+        }
 
-        cbuf.next.store(BufIndex::ZERO, SeqCst);
-
-        Some(CBufWriter { cbuf: cbuf, next: BufIndex::ZERO })
+        let next_ref: &AtomicIndex<SIZE> = &*(next_idx as *const AtomicIndex<SIZE>);
+        Some(Self {
+            buf,
+            next_ref,
+            next_local: next_ref.load(SeqCst),
+        })
     }
 
+    /// Inserts `item` as the newest item in the associated circular buffer.
+    ///
+    /// If the buffer is full (contains `SIZE-1` items), the oldest item
+    /// is implicitly removed from the buffer.
     #[inline(always)]
     pub fn add_item(&mut self, item: T) {
         self.add_item_seq(item, &());
     }
 
+    /// The backing logic for [`add_item`](Self::add_item).
+    ///
+    /// Tests in this crate can use non-[`()`] [`Sequencer`] implementors
+    /// to control concurrency between this [`CBufWriter`] and [`CBufReader`]s.
     #[inline]
     pub(crate) fn add_item_seq<S: Sequencer<WriteProtocolStep>>(&mut self, item: T, seq: &S) {
-        use core::ptr::addr_of_mut;
-
         macro_rules! wrap_atomic {
             ($label:ident, $($x:tt)*) => {
                 seq.wait_for_go_ahead();
@@ -124,82 +288,115 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
             };
         }
 
-        let next_next = self.next + 1;
+        let next_next = self.next_local + 1;
 
         wrap_atomic! { PreWrite, }
         wrap_atomic! { BufferWrite,
             fence(SeqCst);
-            unsafe { write_volatile(addr_of_mut!(self.cbuf.buf[self.next.as_usize() & Self::IDX_MASK]), item) };
+            unsafe { write_volatile(self.buf.add(self.next_local.as_usize() & Self::IDX_MASK), item) };
             fence(SeqCst);
         }
-        wrap_atomic! { IndexPostUpdate, self.cbuf.next.store(next_next, SeqCst); }
+        wrap_atomic! { IndexPostUpdate, self.next_ref.store(next_next, SeqCst); }
 
-        self.next = next_next;
+        self.next_local = next_next;
     }
 
-    pub fn current_items<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a> where 'a: 'b {
-        iter::CBufWriterIterator {
-            idx: self.next - (SIZE-1),
-            writer: self,
+    /// Returns an iterator into the circular buffer's currently-stored items.
+    #[inline]
+    pub fn current_items_iter<'b>(&'b mut self) -> impl Iterator<Item = T> + 'b + Captures<'a>
+    where
+        'a: 'b,
+    {
+        iter::WriterIterator {
+            writer_next: self.next_local,
+            buf:         unsafe { &*(self.buf as *const [T; SIZE]) },
+            idx:         self.next_local - (SIZE - 1),
+            _writer:     self,
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum WriteProtocolStep {
-    PreWrite,
-    BufferWrite,
-    IndexPostUpdate,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ReadResult<T> {
-    /// Normal case; fetched next item.
-    Success(T),
-    /// Fetched an item, but we missed some number.
-    Skipped(T),
-    /// No new items are available.
-    None,
-    /// After trying a number of times, not able to read.
-    SpinFail,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ReadProtocolStep {
-    IndexCheckPre,
-    BufferRead,
-    IndexCheckPost,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum FetchCheckpoint<T> {
-    Step(ReadProtocolStep),
-    ReturnVal(T),
-}
+unsafe impl<'a, T: CBufItem, const SIZE: usize> Send for CBufReader<'a, T, SIZE> {}
 
 impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     const IS_SIZE_OK: bool = CBuf::<T, SIZE>::IS_SIZE_OK;
     const IDX_MASK: usize = CBuf::<T, SIZE>::IDX_MASK;
 
-    pub unsafe fn from_ptr(cbuf: *const CBuf<T, SIZE>) -> Option<Self> {
-        if !Self::IS_SIZE_OK { return None; }
-        let cbuf: &'a CBuf<T, SIZE> = cbuf.as_ref()?;
+    /// The maximum number of times [`fetch_next_item`](Self::fetch_next_item)
+    /// will try to fetch an item from the circular buffer
+    /// before giving up and returning [`ReadResult::SpinFail`].
+    pub const NUM_READ_TRIES: u32 = 16;
 
-        Some(CBufReader { cbuf: cbuf, next: cbuf.next.load(SeqCst) })
+    /// Creates a new [`CBufReader<T, SIZE>`]
+    /// from `buf`, a pointer to the start of the `SIZE`-element array storing a [`CBuf<T, SIZE>`]'s items,
+    /// and `next_idx`, a pointer to the [`CBuf`]'s buffer state,
+    /// assuming they are non-null.
+    ///
+    /// Returns `None` if `buf` or `next_idx` is null.
+    ///
+    /// # Safety
+    ///
+    /// `buf` and `next_idx` must be properly aligned.
+    ///
+    /// The programmer must ensure that the pointees of `buf` and `next_idx` outlive
+    /// the returned [`CBufReader<T, SIZE>`].
+    ///
+    /// Unlike with [`CBufWriter`], there may be multiple [`CBufReader`]s for a given circular buffer.
+    ///
+    /// # Panics
+    ///
+    /// If `SIZE` is not a valid value (a power of 2 that is greater than 1),
+    /// a compile-time panic will be generated.
+    #[inline]
+    pub unsafe fn new_from_ptr(buf: *const T, next_idx: *const AtomicUsize) -> Option<Self> {
+        if !Self::IS_SIZE_OK || buf.is_null() || next_idx.is_null()
+        /*|| !buf.is_aligned() || !next_idx.is_aligned()*/
+        {
+            return None;
+        }
+
+        let next_ref: &AtomicIndex<SIZE> = &*(next_idx as *const AtomicIndex<SIZE>);
+        Some(Self {
+            buf,
+            next_ref,
+            next_local: next_ref.load(SeqCst),
+        })
     }
 
-    const NUM_READ_TRIES: u32 = 16;
-
-    #[inline]
+    /// Tries to fetch the item in the buffer immediately after the one fetched by
+    /// the previous call to [`fetch_next_item`](Self::fetch_next_item). If successful,
+    /// [`ReadResult::Success`] is returned, with the item in question as its payload.
+    ///
+    /// There are a few possible ways trying to fetch the next item can
+    /// fail:
+    ///
+    /// * There may not be a next item, if the previously-fetched item was
+    ///   the last one that's been added to the buffer. In this case,
+    ///   [`ReadResult::None`] is returned.
+    /// * Enough items have been added since the previously-fetched item that
+    ///   the intended next item has already been overwritten. In this case,
+    ///   [`ReadResult::Skipped`] is returned with a payload of either the
+    ///   oldest valid item in the buffer (if `fast_forward` is `false`) or
+    ///   the newest item in the buffer (if `fast_forward` is `true`).
+    /// * If the [`CBufWriter`] is adding new items to the buffer while `fetch_next_item`
+    ///   is trying to read, it's possible the read attempt will get clobbered.
+    ///   If [`NUM_READ_TRIES`](Self::NUM_READ_TRIES) attempts to read occur and they all get clobbered
+    ///   by the writer, [`ReadResult::SpinFail`] is returned.
+    #[inline(always)]
     pub fn fetch_next_item(&mut self, fast_forward: bool) -> ReadResult<T> {
         self.fetch_next_item_seq(fast_forward, &())
     }
 
+    /// The backing logic for [`fetch_next_item`](Self::fetch_next_item).
+    ///
+    /// Tests in this crate can use non-[`()`] [`Sequencer`] implementors
+    /// to control concurrency between this [`CBufReader`]
+    /// and the [`CBufWriter`] and any other [`CBufReader`]s.
     #[inline]
     pub(crate) fn fetch_next_item_seq<S>(&mut self, fast_forward: bool, seq: &S) -> ReadResult<T>
-    where S: Sequencer<FetchCheckpoint<ReadResult<T>>> {
-        use core::ptr::addr_of;
-
+    where
+        S: Sequencer<FetchCheckpoint<ReadResult<T>>>,
+    {
         use ReadResult as RR;
 
         macro_rules! wrap_atomic {
@@ -221,37 +418,48 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             };
         }
 
-        let cbuf = self.cbuf;
         let mut skipped = false;
 
         for _ in 0..Self::NUM_READ_TRIES {
-            let next_0 = wrap_atomic! { IndexCheckPre, cbuf.next.load(SeqCst) };
+            let next_0 = wrap_atomic! { IndexCheckPre, self.next_ref.load(SeqCst) };
             let item = wrap_atomic! { BufferRead,
                 fence(SeqCst);
-                let item = unsafe { read_volatile(addr_of!(cbuf.buf[self.next.as_usize() & Self::IDX_MASK])) };
+                let item = unsafe { read_volatile(self.buf.add(self.next_local.as_usize() & Self::IDX_MASK)) };
                 fence(SeqCst);
                 item
             };
-            let next_1 = wrap_atomic! { IndexCheckPost, cbuf.next.load(SeqCst) };
+            let next_1 = wrap_atomic! { IndexCheckPost, self.next_ref.load(SeqCst) };
             #[cfg(test)]
-            std::eprintln!("next: 0x{:02x}    0: 0x{:02x}    1: 0x{:02x}", self.next.as_usize(), next_0.as_usize(), next_1.as_usize());
+            std::eprintln!(
+                "next: 0x{:02x}    0: 0x{:02x}    1: 0x{:02x}",
+                self.next_local.as_usize(),
+                next_0.as_usize(),
+                next_1.as_usize()
+            );
 
-            let next_next = self.next + 1;
+            let next_next = self.next_local + 1;
 
-            if next_1 == BufIndex::ZERO { send_and_return!(RR::None); }
-            if (self.next == next_0) && (self.next == next_1) { send_and_return!(RR::None); }
+            if next_1 == CBufIndex::ZERO {
+                send_and_return!(RR::None);
+            }
+            if (self.next_local == next_0) && (self.next_local == next_1) {
+                send_and_return!(RR::None);
+            }
 
-            if next_0.is_in_range(next_next, SIZE-1) && next_1.is_in_range(next_next, SIZE-1) {
-                self.next = next_next;
+            // if the CBuf's `next`, while we read `item` from the array,
+            // stayed with the range such that `item` was not written to _and_
+            // had not been previously overwritten by a newer value:
+            if next_0.is_in_range(next_next, SIZE - 1) && next_1.is_in_range(next_next, SIZE - 1) {
+                self.next_local = next_next;
                 send_and_return!(if !skipped { RR::Success(item) } else { RR::Skipped(item) });
             }
 
-            if !(next_1.is_in_range(next_next, SIZE-1)) {
+            if !(next_1.is_in_range(next_next, SIZE - 1)) {
                 // we've gotten too far behind, and we've gotten wrapped by the writer,
                 // or else the circular buffer's been re-initialized;
                 // in either case, we need to play catch-up
-                let offset = if fast_forward { 1 } else { SIZE-1 };
-                self.next = next_1 - offset;
+                let offset = if fast_forward { 1 } else { SIZE - 1 };
+                self.next_local = next_1 - offset;
                 skipped = true;
             }
 
@@ -264,13 +472,158 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         send_and_return!(RR::SpinFail);
     }
 
-    pub fn available_items<'b>(&'b mut self, fast_forward: bool) -> impl Iterator<Item = ReadResult<T>> + 'b + Captures<'a> where 'a: 'b {
-        iter::CBufReaderIterator {
+    /// Returns an iterator that calls [`fetch_next_item`](Self::fetch_next_item) repeatedly
+    /// until we reach the last-written item in the buffer.
+    ///
+    /// `fast_forward` is used as the `fast_forward` argument to calls to
+    /// [`fetch_next_item`](Self::fetch_next_item).
+    #[inline]
+    pub fn available_items_iter<'b>(
+        &'b mut self,
+        fast_forward: bool,
+    ) -> impl Iterator<Item = ReadResult<T>> + 'b + Captures<'a>
+    where
+        'a: 'b,
+    {
+        iter::ReaderIterator {
             reader: self,
             fast_forward,
             is_done: false,
         }
     }
+
+    /// Resets the [`CBufReader`]'s internal current index
+    /// (as used by [`fetch_next_item`](Self::fetch_next_item)
+    /// and returned by [`current_next_index`](Self::current_next_index))
+    /// to just past the last-written item in the buffer.
+    #[inline]
+    pub fn fast_forward(&mut self) {
+        self.next_local = self.next_ref.load(SeqCst);
+    }
+
+    /// Returns the current value of the index used for sequential reads
+    /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
+    /// and [`available_items_iter`](Self::available_items_iter)).
+    #[inline]
+    pub fn current_next_index(&self) -> CBufIndex<SIZE> {
+        self.next_local
+    }
+
+    /// Returns the half-open range of valid indexes for items currently in the circular buffer.
+    #[inline]
+    pub fn current_valid_index_range(&self) -> Range<CBufIndex<SIZE>> {
+        let next = self.next_ref.load(SeqCst);
+        Range {
+            start: next - (SIZE - 1),
+            end:   next,
+        }
+    }
+
+    /// Tries to read the item at index `idx` in the buffer.
+    ///
+    /// If successful, returns the item;
+    /// if not (see [`fetch_next_item`](Self::fetch_next_item) for possible failure modes),
+    /// returns an [`InvalidIndexError`].
+    #[inline(always)]
+    pub fn fetch(&self, idx: CBufIndex<SIZE>) -> Result<T, InvalidIndexError> {
+        self.fetch_seq(idx, &())
+    }
+
+    /// The backing logic for [`fetch`](Self::fetch).
+    ///
+    /// Tests in this crate can use non-[`()`] [`Sequencer`] implementors
+    /// to control concurrency.
+    #[inline]
+    pub(crate) fn fetch_seq<S>(&self, idx: CBufIndex<SIZE>, seq: &S) -> Result<T, InvalidIndexError>
+    where
+        S: Sequencer<FetchCheckpoint<Result<T, InvalidIndexError>>>,
+    {
+        macro_rules! wrap_atomic {
+            ($label:ident, $($x:tt)*) => {
+                {
+                    seq.wait_for_go_ahead();
+                    let x = { $($x)* };
+                    seq.send_result(FetchCheckpoint::Step(ReadProtocolStep::$label));
+                    x
+                }
+            };
+        }
+
+        let next_0 = wrap_atomic! { IndexCheckPre, self.next_ref.load(SeqCst) };
+        let item = wrap_atomic! { BufferRead,
+            fence(SeqCst);
+            let item = unsafe { read_volatile(self.buf.add(idx.as_usize() & Self::IDX_MASK)) };
+            fence(SeqCst);
+            item
+        };
+        let next_1 = wrap_atomic! { IndexCheckPost, self.next_ref.load(SeqCst) };
+
+        #[cfg(test)]
+        std::eprintln!(
+            "idx: {:02x}    next_0: {:02x}    next_1: {:02x}",
+            idx.as_usize(),
+            next_0.as_usize(),
+            next_1.as_usize(),
+        );
+
+        let retval =
+            if next_0.is_in_range(idx + 1, SIZE - 1) && next_1.is_in_range(idx + 1, SIZE - 1) {
+                Ok(item)
+            } else {
+                Err(InvalidIndexError(()))
+            };
+
+        seq.wait_for_go_ahead();
+        seq.send_result(FetchCheckpoint::ReturnVal(retval));
+        retval
+    }
+}
+
+/// The return value of [`CBufReader::fetch_next_item`]
+/// and of the iterator returned by [`CBufReader::available_items_iter`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ReadResult<T> {
+    /// Normal case; fetched next item.
+    Success(T),
+    /// Fetched an item, but we missed some number.
+    Skipped(T),
+    /// No new items are available.
+    None,
+    /// After trying [`CBufReader::NUM_READ_TRIES`] times, not able to successfully read an item.
+    SpinFail,
+}
+
+/// Signifies that the index used in [`CBufReader::fetch`] is not valid.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct InvalidIndexError(());
+
+/// One of the atomic steps in the protocol used by
+/// [`CBufWriter::add_item_seq`] to add an item to a buffer.
+///
+/// Also, one of the checkpoints a [`Sequencer`] may stop at within
+/// [`CBufWriter::add_item_seq`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum WriteProtocolStep {
+    PreWrite,
+    BufferWrite,
+    IndexPostUpdate,
+}
+
+/// One of the atomic steps in the protocol used by
+/// [`CBufReader::fetch_next_item_seq`] to fetch an item from a buffer.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ReadProtocolStep {
+    IndexCheckPre,
+    BufferRead,
+    IndexCheckPost,
+}
+
+/// One of the checkpoints a [`Sequencer`] may stop at within
+/// [`CBufReader::fetch_next_item_seq`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum FetchCheckpoint<T> {
+    Step(ReadProtocolStep),
+    ReturnVal(T),
 }
 
 /// Dummy trait used to satiate the Rust compiler
@@ -284,836 +637,4 @@ pub trait Captures<'_a> {}
 impl<T: ?Sized> Captures<'_> for T {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use super::ReadResult as RR;
-    use core::mem::drop;
-    use core::sync::atomic::Ordering::SeqCst;
-    use std::panic;
-    use std::thread::{spawn, JoinHandle};
-    use std::sync::mpsc;
-    use crate::utils::TestSequencer;
-    use std::vec::Vec;
-
-    #[test]
-    fn can_construct_cbuf() {
-        let a: CBuf<u32, 256> = CBuf::new(42);
-
-        assert_eq!(a.next.load(SeqCst).as_usize(), 0usize);
-        assert_eq!(a.buf.len(), 256);
-        assert!(a.buf.iter().all(|x| *x == 42u32));
-
-        let _b: CBuf<(u64, i32), 64> = CBuf::new((5u64, -3));
-
-        let _c: CBuf<(), 16> = CBuf::new(());
-
-        let _d: CBuf<(), 4096> = CBuf::new_with_default();
-
-        let e: CBuf<isize, 128> = CBuf::new_with_default();
-
-        assert_eq!(e.next.load(SeqCst).as_usize(), 0usize);
-        assert_eq!(e.buf.len(), 128);
-        assert!(e.buf.iter().all(|x| *x == <isize as Default>::default()));
-    }
-
-    #[test]
-    fn can_initialize_cbuf() {
-        use core::mem::MaybeUninit;
-
-        let mut un_cb: MaybeUninit<CBuf<u16, 128>> = MaybeUninit::uninit();
-        let cb = unsafe {
-            CBuf::initialize(un_cb.as_mut_ptr(), 1729);
-            un_cb.assume_init()
-        };
-
-        assert_eq!(cb.next.load(SeqCst).as_usize(), 0usize);
-        assert!(cb.buf.iter().all(|x| *x == 1729));
-    }
-
-    #[test]
-    fn add_an_item() {
-        fn run_cbuf_add_item(
-            initial_buffer: [i16; 4], initial_next: usize,
-            item: i16,
-            final_buffer: [i16; 4], final_next: usize
-        ) {
-            let mut buf: CBuf<i16, 4> = CBuf { buf: initial_buffer, next: AtomicIndex::new(initial_next) };
-            let mut writer = buf.as_writer();
-
-            writer.add_item(item);
-            assert_eq!(buf.buf, final_buffer);
-            assert_eq!(buf.next.load(SeqCst).as_usize(), final_next);
-        }
-
-        run_cbuf_add_item(
-            [-1, -2, -3, -4], 0,
-            99,
-            [99, -2, -3, -4], 1
-        );
-
-        run_cbuf_add_item(
-            [99, -2, -3, -4], 1,
-            101,
-            [99, 101, -3, -4], 2
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, -3, -4], 3,
-            99,
-            [-1, -2, -3, 99], 4
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, -3, 99], 4,
-            101,
-            [101, -2, -3, 99], 5
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, -3, -4], 0x12,
-            99,
-            [-1, -2, 99, -4], 0x13
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, 99, -4], 0x13,
-            101,
-            [-1, -2, 99, 101], 0x14
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, 99, 101], 0x14,
-            202,
-            [202, -2, 99, 101], 0x15
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, -3, -4], usize::MAX - 1,
-            99,
-            [-1, -2, 99, -4], usize::MAX
-        );
-
-        run_cbuf_add_item(
-            [-1, -2, 99, -4], usize::MAX,
-            101,
-            [-1, -2, 99, 101], 4
-        );
-    }
-
-    #[test]
-    fn write_then_read() {
-        let mut cbuf: CBuf<u32, 16> = CBuf::new_with_default();
-        let cbuf_ptr: *mut CBuf<u32, 16> = &mut cbuf;
-
-        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-        let mut reader1 = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-
-        assert_eq!(reader1.fetch_next_item(false), RR::None);
-
-        writer.add_item(42);
-        assert_eq!(reader1.fetch_next_item(false), RR::Success(42));
-
-        let mut reader2 = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-        assert_eq!(reader2.fetch_next_item(false), RR::None);
-
-        writer.add_item(43);
-        assert_eq!(reader1.fetch_next_item(false), RR::Success(43));
-
-        writer.add_item(44);
-        assert_eq!(reader1.fetch_next_item(false), RR::Success(44));
-        assert_eq!(reader1.fetch_next_item(false), RR::None);
-        assert_eq!(reader2.fetch_next_item(false), RR::Success(43));
-        assert_eq!(reader2.fetch_next_item(false), RR::Success(44));
-        assert_eq!(reader2.fetch_next_item(false), RR::None);
-
-        for _ in 0..3 {
-            writer.add_item(99);
-            assert_eq!(reader1.fetch_next_item(false), RR::Success(99));
-        }
-
-        for i in 100..115 {
-            writer.add_item(i);
-            assert_eq!(reader1.fetch_next_item(false), RR::Success(i));
-        }
-
-        assert_eq!(reader2.fetch_next_item(false), RR::Skipped(100));
-        for i in 101..115 {
-            assert_eq!(reader2.fetch_next_item(false), RR::Success(i));
-        }
-
-        for i in 200..215 {
-            writer.add_item(i);
-        }
-        for i in 200..215 {
-            assert_eq!(reader1.fetch_next_item(false), RR::Success(i));
-        }
-
-        writer.add_item(300);
-        assert_eq!(reader2.fetch_next_item(true), RR::Skipped(300));
-
-        drop(cbuf);
-    }
-
-    macro_rules! assert_let {
-        ($value:expr, $p:pat) => {
-            let val = $value;
-            match val {
-                $p => (),
-                _ => panic!(r"assertion failed: `left matches right`
-  left: `{:?}`
- right: `{}`",
-                    val, stringify!($p)
-                )
-            };
-        };
-    }
-
-    macro_rules! step_writer {
-        ($chan_pair:expr) => {
-            let (ref goahead, ref result) = &$chan_pair;
-            let _ = goahead.send(());
-            assert_let!(result.recv(), Ok(_));
-        };
-    }
-
-    macro_rules! step_reader {
-        ($chan_pair:expr) => {
-            let (ref goahead, ref result) = &$chan_pair;
-            let _ = goahead.send(());
-            assert_let!(result.recv(), Ok(FetchCheckpoint::Step(_)));
-        };
-    }
-
-    macro_rules! expect_reader_ret {
-        ($chan_pair:expr, $return_val:expr) => {
-            let (ref goahead, ref result) = &$chan_pair;
-            let _ = goahead.send(());
-            assert_eq!(result.recv(), Ok(FetchCheckpoint::ReturnVal($return_val)));
-        };
-    }
-
-    #[test]
-    fn very_simple_multithreaded() {
-        let mut cbuf: CBuf<(u8, u16), 4> = CBuf::new((0, 0));
-        let cbuf_ptr: *mut CBuf<(u8, u16), 4> = &mut cbuf;
-
-        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-        let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-
-        let (ts_wr, chans_wr) = TestSequencer::new();
-        let (ts_rd, chans_rd) = TestSequencer::new();
-
-        let jh_wr = spawn(move || {
-            writer.add_item_seq((1, 1), &ts_wr);
-        });
-
-        let jh_rd = spawn(move || {
-            let _ = reader.fetch_next_item_seq(false, &ts_rd);
-            let _ = reader.fetch_next_item_seq(false, &ts_rd);
-        });
-
-        for _ in 0..3 { step_reader!(chans_rd); }
-        expect_reader_ret!(chans_rd, RR::None);
-
-        for _ in 0..3 { step_writer!(chans_wr); }
-        for _ in 0..3 { step_reader!(chans_rd); }
-        expect_reader_ret!(chans_rd, RR::Success((1, 1)));
-
-        for jh in [jh_wr, jh_rd] {
-            let _ = jh.join();
-        }
-
-        drop(cbuf);
-    }
-
-    #[test]
-    fn simple_interleaved_read_and_write() {
-        let mut cbuf: CBuf<i16, 16> = CBuf::new(0);
-        let cbuf_ptr: *mut CBuf<i16, 16> = &mut cbuf;
-
-        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-        let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-
-        cbuf.buf = [-1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15, -16];
-        cbuf.next.store(BufIndex::new(0x21), SeqCst);
-        writer.next = BufIndex::new(0x21);
-        reader.next = BufIndex::new(0x12);
-
-        let (ts_wr, chans_wr) = TestSequencer::new();
-        let (ts_rd, chans_rd) = TestSequencer::new();
-
-        let jh_wr = spawn(move || {
-            writer.add_item_seq(42, &ts_wr);
-            writer.add_item_seq(43, &ts_wr);
-            writer.add_item_seq(44, &ts_wr);
-            writer.add_item_seq(45, &ts_wr);
-        });
-        let jh_rd = spawn(move || {
-            let _ = reader.fetch_next_item_seq(false, &ts_rd);
-            let _ = reader.fetch_next_item_seq(true, &ts_rd);
-            let _ = reader.fetch_next_item_seq(false, &ts_rd);
-        });
-
-        step_reader!(chans_rd);
-        for _ in 0..3 { step_writer!(chans_wr); }
-        step_reader!(chans_rd);
-        step_reader!(chans_rd);
-        for _ in 0..3 { step_reader!(chans_rd); }
-        expect_reader_ret!(chans_rd, RR::Skipped(-4));
-
-        step_reader!(chans_rd);
-        for _ in 0..(2*3) { step_writer!(chans_wr); }
-        step_reader!(chans_rd);
-        step_reader!(chans_rd);
-        for _ in 0..3 { step_reader!(chans_rd); }
-        expect_reader_ret!(chans_rd, RR::Skipped(44));
-
-        step_reader!(chans_rd);
-        for _ in 0..3 { step_writer!(chans_wr); }
-        for _ in 0..2 { step_reader!(chans_rd); }
-        for _ in 0..3 { step_reader!(chans_rd); }
-        expect_reader_ret!(chans_rd, RR::Success(45));
-
-        for jh in [jh_wr, jh_rd] {
-            let _ = jh.join();
-        }
-
-        drop(cbuf);
-    }
-
-    #[test]
-    fn get_to_spinfail() {
-        #[allow(non_snake_case)]
-        let NUM_READ_TRIES = CBufReader::<(), 4096>::NUM_READ_TRIES;
-
-        let mut cbuf: CBuf<(), 4096> = CBuf::new_with_default();
-        let cbuf_ptr: *mut CBuf<(), 4096> = &mut cbuf;
-
-        let mut writer = unsafe { CBufWriter::from_ptr_init(cbuf_ptr) }.unwrap();
-        let mut reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-
-        cbuf.next.store(BufIndex::new(0x2005), SeqCst);
-        writer.next = BufIndex::new(0x2005);
-        reader.next = BufIndex::new(0x1006);
-
-        let (ts_wr, chans_wr) = TestSequencer::new();
-        let (ts_rd, chans_rd) = TestSequencer::new();
-
-        let join_handles = [
-            spawn(move || {
-                for _ in 0..NUM_READ_TRIES {
-                    writer.add_item_seq((), &ts_wr);
-                }
-            }),
-            spawn(move || {
-                reader.fetch_next_item_seq(false, &ts_rd);
-            })
-        ];
-
-        for _ in 0..NUM_READ_TRIES {
-            step_reader!(chans_rd);
-
-            for _ in 0..3 { step_writer!(chans_wr); }
-
-            step_reader!(chans_rd);
-            step_reader!(chans_rd);
-        }
-        expect_reader_ret!(chans_rd, RR::SpinFail);
-
-        for jh in join_handles {
-            let _ = jh.join();
-        }
-
-        drop(cbuf);
-    }
-
-    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    enum TraceStep<T> {
-        Reader(FetchCheckpoint<ReadResult<T>>),
-        Writer(WriteProtocolStep),
-    }
-
-    fn iterate_over_event_sequences<GEN, RD, WR, T, const SIZE: usize, A>(
-        generator: &GEN,
-        read_thread_generator: &RD,
-        initial_read_next: usize,
-        write_thread_generator: &WR,
-        action: &mut A
-    )
-    where T: CBufItem,
-    GEN: Fn() -> CBuf<T, SIZE>,
-    RD: Fn(CBufReader<'static, T, SIZE>, TestSequencer<FetchCheckpoint<ReadResult<T>>>) -> JoinHandle<()>,
-    WR: Fn(CBufWriter<'static, T, SIZE>, TestSequencer<WriteProtocolStep>) -> JoinHandle<()>,
-    A: FnMut(&[TraceStep<T>]) {
-        use std::boxed::Box;
-
-        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-        enum EventStep {
-            Reader,
-            Writer,
-        }
-
-        type ChannelPair<X> = (mpsc::Sender<()>, mpsc::Receiver<X>);
-
-        struct RunningState<U, const SZ: usize> where U: CBufItem {
-            cbuf: Box<CBuf<U, SZ>>,
-            trace: Vec<TraceStep<U>>,
-            chans_wr: ChannelPair<WriteProtocolStep>,
-            chans_rd: ChannelPair<FetchCheckpoint<ReadResult<U>>>,
-            jhandles: [JoinHandle<()>; 2],
-        }
-
-        // impl Fn(&[EventStep]) -> RunningState<T, SIZE>
-        let mut replay_event_chain = |chain: &[EventStep]| {
-            use EventStep as ES;
-            use TraceStep as TS;
-
-            //std::eprintln!("replaying {:?}", chain);
-
-            let mut cbuf = Box::new(generator());
-            let cbuf_ptr: *mut CBuf<T, SIZE> = cbuf.as_mut();
-            let mut trace: Vec<TraceStep<T>> = Vec::with_capacity(chain.len());
-
-            let buf_writer = CBufWriter {
-                next: cbuf.next.load(SeqCst),
-                cbuf: unsafe { &mut *cbuf_ptr },
-            };
-            let mut buf_reader = unsafe { CBufReader::from_ptr(cbuf_ptr) }.unwrap();
-            buf_reader.next = BufIndex::new(initial_read_next);
-
-            let (ts_wr, chans_wr) = TestSequencer::new();
-            let (ts_rd, chans_rd) = TestSequencer::new();
-
-            let jhandles = [
-                write_thread_generator(buf_writer, ts_wr),
-                read_thread_generator(buf_reader, ts_rd),
-            ];
-
-            for step in chain {
-                match step {
-                    ES::Reader => {
-                        let (goahead, result) = &chans_rd;
-                        let _ = goahead.send(());
-                        match result.recv() {
-                            Ok(r) => { trace.push(TS::Reader(r)); }
-                            Err(e) => { panic!("Unexpected error `{:?}` during replay of event chain {:?}", e, chain); }
-                        }
-                    }
-                    ES::Writer => {
-                        let (goahead, result) = &chans_wr;
-                        let _ = goahead.send(());
-                        match result.recv() {
-                            Ok(r) => { trace.push(TS::Writer(r)); }
-                            Err(e) => { panic!("Unexpected error `{:?}` during replay of event chain {:?}", e, chain); }
-                        }
-                    }
-                }
-            }
-
-            RunningState { cbuf, trace, chans_wr, chans_rd, jhandles }
-        };
-
-        let root_state = replay_event_chain(&[]);
-
-        let mut recurse_over_event_chains = |
-            event_steps: Vec<EventStep>,
-            currently_running_state: RunningState<T, SIZE>
-        | {
-            // Helper function used to allow the logic of the closure to be recursive.
-            // Technique due to <https://stackoverflow.com/a/72862424>.
-            fn helper<REC, A, T, const SIZE: usize>(
-                event_steps: Vec<EventStep>,
-                currently_running_state: RunningState<T, SIZE>,
-                replay_event_chain: &mut REC,
-                action: &mut A
-            ) where
-            T: CBufItem,
-            REC: FnMut(&[EventStep]) -> RunningState<T, SIZE>,
-            A: FnMut(&[TraceStep<T>]) {
-                use EventStep as ES;
-                use TraceStep as TS;
-
-                //std::eprintln!("recursing on {:?}", &event_steps[..]);
-
-                // Try another writer step.
-                let mut wr_events = event_steps.clone();
-                let mut wr_trace = currently_running_state.trace.clone();
-
-                let (goahead, result) = &currently_running_state.chans_wr;
-                let _ = goahead.send(());
-                match result.recv() {
-                    Err(_) => {
-                        // The writer thread has finished; run the reader to completion.
-                        let (goahead, result) = &currently_running_state.chans_rd;
-                        while let Ok(val) = { let _ = goahead.send(()); result.recv() } {
-                            wr_trace.push(TS::Reader(val));
-                        }
-                        for jh in currently_running_state.jhandles {
-                            let _ = jh.join();
-                        }
-                        drop(currently_running_state.cbuf);
-                        //std::eprintln!("applying action on trace {:?}", &wr_events[..]);
-                        action(&wr_trace);
-
-                        // "Try another reader step" below would just
-                        // repeat this sequence of events, so there's
-                        // no need to run it.
-                        return;
-                    }
-                    Ok(val) => {
-                        wr_trace.push(TS::Writer(val));
-                        wr_events.push(ES::Writer);
-                        helper(wr_events, RunningState { trace: wr_trace, ..currently_running_state }, replay_event_chain, action);
-                    }
-                }
-
-                // Try another reader step.
-                // We consumed the passed-in threads in "try another writer step",
-                // so we need to recreate them first.
-                let mut reader_state = replay_event_chain(&event_steps);
-                let mut reader_events = event_steps.clone();
-
-                let (goahead, result) = &reader_state.chans_rd;
-                let _ = goahead.send(());
-                match result.recv() {
-                    Err(_) => {
-                        // The reader thread has finished. Wind up execution.
-                        let (goahead, result) = &reader_state.chans_wr;
-                        while let Ok(_) = { let _ = goahead.send(()); result.recv() } {}
-                        for jh in reader_state.jhandles {
-                            let _ = jh.join();
-                        }
-                        drop(reader_state.cbuf);
-
-                        // If the situation was symmetrical between reader and writer,
-                        // we'd now call action()... but we've already done that with
-                        // this particular sequence of events in the recursion in
-                        // "try another writer step" above, so we'd just be repeating
-                        // that sequence.
-                        return;
-                    }
-                    Ok(val) => {
-                        reader_state.trace.push(TS::Reader(val));
-                        reader_events.push(ES::Reader);
-                        helper(reader_events, reader_state, replay_event_chain, action);
-                    }
-                }
-            }
-            helper(event_steps, currently_running_state, &mut replay_event_chain, action);
-        };
-
-        recurse_over_event_chains(Vec::new(), root_state);
-    }
-
-    // named after the unary iota function in APL
-    const fn iota<const SIZE: usize>() -> [u32; SIZE] {
-        let mut x = [0u32; SIZE];
-        let mut i = 0;
-        while i < SIZE {
-            x[i] = i as u32;
-            i += 1;
-        }
-        x
-    }
-
-    #[test]
-    fn mini_model_example() {
-        let mut i = 0usize;
-        iterate_over_event_sequences(
-            &|| {
-                CBuf {
-                    buf: iota::<16>(),
-                    next: AtomicIndex::new(0x14),
-                }
-            },
-            &|mut reader, sequencer| {
-                spawn(move || {
-                    let _ = reader.fetch_next_item_seq(false, &sequencer);
-                })
-            },
-            0x13,
-            &|mut writer, sequencer| {
-                spawn(move || {
-                    writer.add_item_seq(42, &sequencer);
-                })
-            },
-            &mut |trace| {
-                std::eprintln!("{}: {:?}", i, trace);
-                i += 1;
-                assert!(trace.len() > 0);
-            }
-        );
-        //panic!("panicking just so we can see the list of all traces");
-    }
-
-    /// A test case with one write and one read where neither should interfere with each other.
-    #[test]
-    fn mini_model_no_interference_1w1r() {
-        use TraceStep as TS;
-        use FetchCheckpoint as FC;
-
-        iterate_over_event_sequences(
-            &|| {
-                CBuf {
-                    buf: iota::<16>(),
-                    next: AtomicIndex::new(0x14),
-                }
-            },
-            &|mut reader, sequencer| {
-                spawn(move || {
-                    let _ = reader.fetch_next_item_seq(false, &sequencer);
-                })
-            },
-            0x11,
-            &|mut writer, sequencer| {
-                spawn(move || {
-                    writer.add_item_seq(42, &sequencer);
-                })
-            },
-            &mut |trace| {
-                std::eprintln!("testing {:?}", trace);
-
-                assert!(trace.len() > 0);
-
-                assert_eq!(
-                    trace.iter().filter(|ref t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
-                    1
-                );
-
-                for t in trace {
-                    if let TS::Reader(FC::ReturnVal(val)) = *t {
-                        assert_eq!(val, ReadResult::Success(1));
-                    }
-                }
-            }
-        );
-    }
-
-    trait SliceExt {
-        type Item;
-
-        fn prev_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item>;
-        fn next_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item>;
-    }
-
-    impl<T: Clone> SliceExt for [T] {
-        type Item = T;
-
-        fn prev_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item> {
-            let mut i = index;
-            while i > 0 {
-                i -= 1;
-                if predicate(&self[i]) {
-                    return Some(self[i].clone());
-                }
-            }
-            None
-        }
-
-        fn next_with<F: Fn(&Self::Item) -> bool>(&self, index: usize, predicate: F) -> Option<Self::Item> {
-            for i in &self[(index+1)..] {
-                if predicate(i) {
-                    return Some(i.clone());
-                }
-            }
-            None
-        }
-    }
-
-    macro_rules! prev_with_pat {
-        ($array:expr, $index:expr, $pattern:pat) => {
-            $array.prev_with($index, |ref item| matches!(item, $pattern))
-        }
-    }
-
-    macro_rules! next_with_pat {
-        ($array:expr, $index:expr, $pattern:pat) => {
-            $array.next_with($index, |ref item| matches!(item, $pattern))
-        }
-    }
-
-    /// A test case with one write and one read where interference is possible in some cases.
-    #[test]
-    fn mini_model_interference_1w1r_no_ff() {
-        use TraceStep as TS;
-        use FetchCheckpoint as FC;
-        use ReadProtocolStep as RPS;
-        use WriteProtocolStep as WPS;
-
-        iterate_over_event_sequences(
-            &|| {
-                CBuf {
-                    buf: iota::<16>(),
-                    next: AtomicIndex::new(0x23),
-                }
-            },
-            &|mut reader, sequencer| {
-                spawn(move || {
-                    let _ = reader.fetch_next_item_seq(false, &sequencer);
-                })
-            },
-            0x14,
-            &|mut writer, sequencer| {
-                spawn(move || {
-                    writer.add_item_seq(42, &sequencer);
-                })
-            },
-            &mut |trace| {
-                std::eprintln!("testing {:?}", trace);
-
-                // something should have happened
-                assert!(trace.len() > 0);
-
-                // there should be one return from fetch_next_item_seq() :)
-                assert_eq!(
-                    trace.iter().filter(|t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
-                    1
-                );
-
-                // return value should be one of Success(4), Skipped(5), and SpinFail
-                let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
-                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
-                    _ => unreachable!(),
-                };
-                assert_let!(return_value, RR::Success(4) | RR::Skipped(5) | RR::SpinFail);
-
-                for (i, t) in trace.iter().enumerate() {
-                    // if, in the interval between the IndexCheckPre and IndexCheckPost,
-                    // an IndexPostUpdate occurs, the reader should do another read sequence
-                    // (or call it quits with a return of SpinFail)
-                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) {
-                        let mut j = i;
-                        let interleaved_postupdate = 'x: loop {
-                            while j > 0 {
-                                j -= 1;
-                                match trace[j] {
-                                    TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
-                                    TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
-                                    _ => {}
-                                }
-                            }
-                            panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
-                        };
-                        if interleaved_postupdate {
-                            assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
-                        }
-                    }
-
-                    // if the last read sequence occurs entirely before the write sequence,
-                    // we should return Success(4)
-                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
-                        if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                            assert_eq!(return_value, RR::Success(4));
-                        }
-                    }
-
-                    // if the last read sequence occurs entirely after the write sequence,
-                    // we should return Skipped(5) or, if *right* after the write sequence,
-                    // possibly SpinFail
-                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
-                        if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                            if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
-                                assert_let!(return_value, RR::Skipped(5) | RR::SpinFail);
-                            } else {
-                                assert_eq!(return_value, RR::Skipped(5));
-                            }
-                        }
-                    }
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn mini_model_interference_1w1r_ff() {
-        use TraceStep as TS;
-        use FetchCheckpoint as FC;
-        use ReadProtocolStep as RPS;
-        use WriteProtocolStep as WPS;
-
-        iterate_over_event_sequences(
-            &|| {
-                CBuf {
-                    buf: iota::<16>(),
-                    next: AtomicIndex::new(0x23),
-                }
-            },
-            &|mut reader, sequencer| {
-                spawn(move || {
-                    let _ = reader.fetch_next_item_seq(true, &sequencer);
-                })
-            },
-            0x14,
-            &|mut writer, sequencer| {
-                spawn(move || {
-                    writer.add_item_seq(42, &sequencer);
-                })
-            },
-            &mut |trace| {
-                std::eprintln!("testing {:?}", trace);
-
-                // something should have happened in the course of things:
-                assert!(trace.len() > 0);
-
-                // there should be only one return from fetch_next_item_seq()
-                assert_eq!(
-                    trace.iter().filter(|t| matches!(t, TS::Reader(FC::ReturnVal(_)))).count(),
-                    1
-                );
-
-                // return value of fetch should be one of Success(4), Skipped(42), and SpinFail
-                let return_value = match prev_with_pat!(trace, trace.len(), TS::Reader(FC::ReturnVal(_))) {
-                    Some(TS::Reader(FC::ReturnVal(rval))) => rval,
-                    _ => unreachable!(),
-                };
-                assert_let!(return_value, RR::Success(4) | RR::Skipped(42) | RR::SpinFail);
-
-                for (i, t) in trace.iter().enumerate() {
-                    // if, in the interval between the IndexCheckPre and IndexCheckPost,
-                    // an IndexPostUpdate occurs, the reader should do another read sequence
-                    // (or call it quits with a return of SpinFail)
-                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) {
-                        let mut j = i;
-                        let interleaved_postupdate = 'x: loop {
-                            while j > 0 {
-                                j -= 1;
-                                match trace[j] {
-                                    TS::Reader(FC::Step(RPS::IndexCheckPre)) => { break 'x false; }
-                                    TS::Writer(WPS::IndexPostUpdate) => { break 'x true; }
-                                    _ => {}
-                                }
-                            }
-                            panic!("An IndexCheckPost occurred without a preceding IndexCheckPre");
-                        };
-                        if interleaved_postupdate {
-                            assert!(next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre)) | TS::Reader(FC::ReturnVal(RR::SpinFail))).is_some());
-                        }
-                    }
-
-                    // if the last read sequence occurs entirely before the write sequence,
-                    // we should return Success(4)
-                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPost)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPost))).is_none() {
-                        if prev_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                            assert_eq!(return_value, RR::Success(4));
-                        }
-                    }
-
-                    // if the last read sequence occurs entirely after the write sequence,
-                    // we should return Skipped(42), or, if *right* after the write sequence,
-                    // possibly SpinFail
-                    if *t == TS::Reader(FC::Step(RPS::IndexCheckPre)) && next_with_pat!(trace, i, TS::Reader(FC::Step(RPS::IndexCheckPre))).is_none() {
-                        if next_with_pat!(trace, i, TS::Writer(_)).is_none() {
-                            if i >= 1 && matches!(trace[i-1], TS::Writer(_)) {
-                                assert_let!(return_value, RR::Skipped(42) | RR::SpinFail);
-                            } else {
-                                assert_let!(return_value, RR::Skipped(42));
-                            }
-                        }
-                    }
-                }
-            }
-        );
-
-        //std::panic!("HA! HA! I'm using the Internet!!1");
-    }
-}
+mod tests;
