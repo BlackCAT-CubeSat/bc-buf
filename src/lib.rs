@@ -594,7 +594,7 @@ pub enum ReadResult<T> {
 }
 
 /// Signifies that the index used in [`CBufReader::fetch`] is not valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct InvalidIndexError(());
 
 /// One of the atomic steps in the protocol used by
@@ -602,7 +602,7 @@ pub struct InvalidIndexError(());
 ///
 /// Also, one of the checkpoints a [`Sequencer`] may stop at within
 /// [`CBufWriter::add_item_seq`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum WriteProtocolStep {
     PreWrite,
     BufferWrite,
@@ -611,7 +611,7 @@ pub(crate) enum WriteProtocolStep {
 
 /// One of the atomic steps in the protocol used by
 /// [`CBufReader::fetch_next_item_seq`] to fetch an item from a buffer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum ReadProtocolStep {
     IndexCheckPre,
     BufferRead,

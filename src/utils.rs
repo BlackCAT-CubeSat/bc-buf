@@ -43,7 +43,7 @@ use std::sync::mpsc;
 //   * the next item will be written to cb.buf[idx & (SIZE-1)]
 //   * once the next item has been written, the next value of cb.next will be max(idx.wrapping_add(1), SIZE)
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CBufIndex<const SIZE: usize> {
     idx: usize,
 }
