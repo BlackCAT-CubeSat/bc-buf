@@ -4,5 +4,7 @@ version = "0.0.0"
 description = "A non-blocking single-writer/multiple-reader circular buffer"
 license = "MIT OR Apache-2.0"
 edition = "2021"
+repository = "https://github.com/BlackCAT-CubeSat/bc-buf"
+readme = "README.md"
 
 [dependencies]
