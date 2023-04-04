@@ -170,6 +170,8 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     }
 
     /// Returns a [`CBufReader`] for reading elements from `self`.
+    ///
+    /// `next_index` for reading is initialized to end of available data.
     #[inline]
     pub fn as_reader<'a>(&'a self) -> CBufReader<'a, T, SIZE> {
         CBufReader {
@@ -507,6 +509,107 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     #[inline]
     pub fn current_next_index(&self) -> CBufIndex<SIZE> {
         self.next_local
+    }
+
+    /// Sets the index used for sequential reads.
+    ///
+    /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
+    /// and [`available_items_iter`](Self::available_items_iter)).
+    #[inline]
+    pub fn set_next_index(&mut self, next: CBufIndex<SIZE>) {
+        self.next_local = next;
+    }
+
+    /// Finds the earliest valid index that makes the predicate true
+    /// assuming buffer contents are sorted by `predicate()` in `false`, `true` order.
+    ///
+    /// If `fromstart` is set, searches all available data, otherwise
+    /// the search starts at the `current_next_index()`.
+    ///
+    /// On completion, the `current_next_index()` is set to
+    /// the returned index, or to the end index if
+    /// no true value is found and InvalidIndexError.
+    /// if buffer contents are sorted by `predicate()` in `false`, `true` order.
+    ///
+    /// Returns `InvalidIndexError` if no such index exists.
+    ///
+    /// If data is not sorted by `predicate()` (i.e. if at least one
+    /// item that makes the predicate `false` is later than at
+    /// least one item that makes the predicate `true`) the
+    /// function may return either an index that makes the predicate
+    /// true, or an `InvalidIndexError`.
+    pub fn search(
+        &mut self,
+        predicate: &dyn Fn(T) -> bool,
+        fromstart: bool,
+    ) -> Result<CBufIndex<SIZE>, InvalidIndexError> {
+        let valids = self.current_valid_index_range();
+
+        // let failure = || {
+        //     self.set_next_index(valids.end);
+        //     Err(InvalidIndexError(()))
+        // };
+        // let success = | idx | {
+        //     self.set_next_index(idx);
+        //     Ok(idx)
+        // };
+        macro_rules! failure {
+            () => {{
+                self.set_next_index(valids.end);
+                Err(InvalidIndexError(()))
+            }};
+        }
+        macro_rules! success {
+            ($idx:ident) => {{
+                self.set_next_index($idx);
+                Ok($idx)
+            }};
+        }
+        if fromstart {
+            self.set_next_index(valids.start)
+        }
+        match self.fetch_next_item(false) {
+            ReadResult::None | ReadResult::SpinFail => return failure!(),
+            ReadResult::Skipped(v) | ReadResult::Success(v) => {
+                if predicate(v) {
+                    let idx = self.current_next_index() - 1;
+                    return success!(idx);
+                }
+            }
+        }
+        let mut ifalse = self.current_next_index() - 1;
+        let mut itrue = valids.end - 1;
+        // Verify that the predicate is true at the end
+        match self.fetch(itrue) {
+            Ok(v) => {
+                if !predicate(v) {
+                    return failure!();
+                }
+            }
+            Err(_) => return failure!(),
+        }
+        // At this point, ifalse < itrue and index to false and true values
+
+        while ifalse + 1 < itrue {
+            // let imid = ifalse + (ifalse.signed_offset_to(&itrue) as usize) / 2;
+            let imid = ifalse + itrue.sub(ifalse).unwrap() / 2;
+
+            match self.fetch(imid) {
+                Ok(v) => {
+                    if predicate(v) {
+                        itrue = imid;
+                    } else {
+                        ifalse = imid;
+                    }
+                }
+                Err(_) => {
+                    // Not strictly accurate:  This is when the writer overtakes
+                    // the data being searched.
+                    return failure!();
+                }
+            }
+        }
+        return success!(itrue);
     }
 
     /// Returns the half-open range of valid indexes for items currently in the circular buffer.

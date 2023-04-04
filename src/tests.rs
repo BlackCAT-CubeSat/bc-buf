@@ -143,6 +143,69 @@ fn write_then_read() {
     drop(cbuf);
 }
 
+#[test]
+fn write_wrap_read() {
+    const SZ: usize = 16;
+    let mut cbuf: CBuf<u16, SZ> = CBuf::new(9999);
+
+    // How do I make a new writer?  The tests all use unsafe {new_from_ptr}
+    // let mut writer = CBufWriter::new(buf);
+    // let (buf_ptr, next_ptr) = cbuf.as_mut_ptrs();
+    // let mut writer  = unsafe { CBufWriter::<u16, SZ>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+    // let mut reader  = unsafe { CBufReader::<u16, SZ>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
+
+    let ivalids = cbuf.as_reader().current_valid_index_range();
+    assert_eq!(ivalids.start.as_usize(), 0);
+    assert_eq!(ivalids.end.as_usize(), 0);
+
+    let mut writer = cbuf.as_writer();
+
+    for i in 0u16..3 * (SZ as u16) {
+        writer.add_item(i);
+    }
+
+    let mut reader = cbuf.as_reader();
+
+    let ivalids = reader.current_valid_index_range();
+
+    assert_eq!(ivalids.start.as_usize(), 2 * SZ + 1);
+    assert_eq!(ivalids.end.as_usize(), 3 * SZ);
+
+    reader.set_next_index(ivalids.start);
+
+    let mut i = ivalids.start.as_usize() as u16;
+    for value in reader.available_items_iter(false) {
+        match value {
+            RR::Success(v) => {
+                assert_eq!(v, i);
+                i += 1;
+            }
+            _ => {
+                panic!("Read back failed at {}: {:?}", i, value);
+            }
+        }
+    }
+    assert_eq!(i, 3 * SZ as u16);
+
+    // Search for value
+    for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
+        let pred = |x| x >= i as u16;
+        match reader.search(&pred, true) {
+            Ok(idx) => {
+                let next = reader.fetch_next_item(false);
+                let value = reader.fetch(idx).unwrap();
+                assert!(pred(value));
+
+                // assert_eq!(reader.fetch_next_item(false), RR::Success(i));
+                // FIXME assert that the previous index is either before the start or gives lamb = false
+            }
+            Err(_) => {
+                assert!(!pred(reader.fetch(ivalids.end - 1).unwrap()));
+            }
+        }
+    }
+}
+
 macro_rules! assert_let {
     ($value:expr, $p:pat) => {
         let val = $value;

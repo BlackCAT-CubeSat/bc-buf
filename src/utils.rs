@@ -43,6 +43,11 @@ use std::sync::mpsc;
 //   * the next item will be written to cb.buf[idx & (SIZE-1)]
 //   * once the next item has been written, the next value of cb.next will be max(idx.wrapping_add(1), SIZE)
 
+// Ordering and arithmetic
+//   Ordering and arithmetic assume that two indices are within half the possible index range of each other.
+//   e.g., if `idx1 = usize::MAX - 10;` and `idx2 = usize::(SIZE + 3)` then it assumes that idx2 is 13 steps (and one `usize` wrap) beyond idx1
+//
+// #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CBufIndex<const SIZE: usize> {
     idx: usize,
@@ -79,6 +84,14 @@ impl<const SIZE: usize> Default for CBufIndex<SIZE> {
     #[inline]
     fn default() -> Self {
         Self::new(0)
+    }
+}
+
+/// Ordering for `CBufIndex<SIZE>`
+impl<const SIZE: usize> Ord for CBufIndex<SIZE> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        let idelta: isize = other.idx.wrapping_sub(self.idx) as isize;
+        return idelta.cmp(&0isize);
     }
 }
 
@@ -190,6 +203,29 @@ impl<const SIZE: usize> CBufIndex<SIZE> {
             } else {
                 (base_ <= idx) || ((SIZE <= idx) && (idx < end))
             }
+        }
+    }
+
+    /// Signed value that must be added to `self` to give the other.
+    #[inline]
+    pub fn signed_offset_to(self, other: &Self) -> isize {
+        const HALFSIZE: usize = (usize::MAX - 1) / 2;
+        let mut udelta = other.idx.wrapping_sub(self.idx);
+        if udelta < HALFSIZE {
+            // offset is positive, but might be a wrap
+            if other.idx < HALFSIZE && self.idx > HALFSIZE && other.idx > SIZE {
+                udelta -= SIZE;
+            }
+            udelta as isize
+        } else {
+            // This should not check ranges, according to
+            // https://doc.rust-lang.org/reference/expressions/operator-expr.html#type-cast-expressions
+            let mut idelta = udelta as isize;
+            // Offset is negative, but might be a wrap
+            if other.idx > HALFSIZE && self.idx < HALFSIZE && self.idx >= SIZE {
+                idelta += SIZE as isize
+            }
+            idelta
         }
     }
 }
