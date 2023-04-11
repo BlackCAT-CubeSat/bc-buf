@@ -171,7 +171,8 @@ fn write_wrap_read() {
     assert_eq!(ivalids.start.as_usize(), 2 * SZ + 1);
     assert_eq!(ivalids.end.as_usize(), 3 * SZ);
 
-    reader.set_next_index(ivalids.start);
+    // reader.set_next_index(ivalids.start);
+    reader.rewind();
 
     let mut i = ivalids.start.as_usize() as u16;
     for value in reader.available_items_iter(false) {
@@ -189,18 +190,21 @@ fn write_wrap_read() {
 
     // Search for value
     for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
-        let pred = |x| x >= i as u16;
-        match reader.search(&pred, true) {
+        let predicate = |x| x >= i as u16;
+        match reader.search(&predicate, true) {
             Ok(idx) => {
-                let next = reader.fetch_next_item(false);
+                let _next = reader.fetch_next_item(false);
                 let value = reader.fetch(idx).unwrap();
-                assert!(pred(value));
+                assert!(predicate(value));
+                if idx >= ivalids.start {
+                    assert_eq!(idx.as_usize() as u16, value);
+                }
 
                 // assert_eq!(reader.fetch_next_item(false), RR::Success(i));
                 // FIXME assert that the previous index is either before the start or gives lamb = false
             }
             Err(_) => {
-                assert!(!pred(reader.fetch(ivalids.end - 1).unwrap()));
+                assert!(!predicate(reader.fetch(ivalids.end - 1).unwrap()));
             }
         }
     }

@@ -43,11 +43,12 @@ use std::sync::mpsc;
 //   * the next item will be written to cb.buf[idx & (SIZE-1)]
 //   * once the next item has been written, the next value of cb.next will be max(idx.wrapping_add(1), SIZE)
 
-// Ordering and arithmetic
-//   Ordering and arithmetic assume that two indices are within half the possible index range of each other.
-//   e.g., if `idx1 = usize::MAX - 10;` and `idx2 = usize::(SIZE + 3)` then it assumes that idx2 is 13 steps (and one `usize` wrap) beyond idx1
-//
-// #[derive(Debug, PartialEq, Eq, PartialOrd, Clone, Copy)]
+// Ordering and arithmetic:
+// CBufIndex<SIZE> is 'locally ordered' in the sense that two indices can be
+// validly compared if they are within half the possible index range of each other.
+// If one index was written more than (usize::MAX - SIZE)/2 after the other, then
+// the comparison may be incorrect.  Likewise signed_offset may be incorrect if
+// the correct value is outside of the valid range of [isize::MIN + SIZE, isize::MAX - SIZE]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CBufIndex<const SIZE: usize> {
     idx: usize,
@@ -88,10 +89,10 @@ impl<const SIZE: usize> Default for CBufIndex<SIZE> {
 }
 
 /// Ordering for `CBufIndex<SIZE>`
-impl<const SIZE: usize> Ord for CBufIndex<SIZE> {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+impl<const SIZE: usize> PartialOrd for CBufIndex<SIZE> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         let idelta: isize = other.idx.wrapping_sub(self.idx) as isize;
-        return idelta.cmp(&0isize);
+        idelta.partial_cmp(&0isize)
     }
 }
 
