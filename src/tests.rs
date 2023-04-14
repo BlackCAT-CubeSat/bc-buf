@@ -148,12 +148,6 @@ fn write_wrap_read() {
     const SZ: usize = 16;
     let mut cbuf: CBuf<u16, SZ> = CBuf::new(9999);
 
-    // How do I make a new writer?  The tests all use unsafe {new_from_ptr}
-    // let mut writer = CBufWriter::new(buf);
-    // let (buf_ptr, next_ptr) = cbuf.as_mut_ptrs();
-    // let mut writer  = unsafe { CBufWriter::<u16, SZ>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
-    // let mut reader  = unsafe { CBufReader::<u16, SZ>::new_from_ptr(buf_ptr, next_ptr) }.unwrap();
-
     let ivalids = cbuf.as_reader().current_valid_index_range();
     assert_eq!(ivalids.start.as_usize(), 0);
     assert_eq!(ivalids.end.as_usize(), 0);
@@ -188,26 +182,51 @@ fn write_wrap_read() {
     }
     assert_eq!(i, 3 * SZ as u16);
 
-    // Search for value
+
+    // Search for value no earlier than a read index
+    let idx_partway = ivalids.start + 10;
+    let partreader = reader.reader_stating_at(idx_partway);
+        for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
+        let predicate = |x| x >= i as u16;
+        match partreader.search(&predicate, false) {
+            Ok(idx) => {
+                let value = partreader.fetch(idx).unwrap();
+                assert!(predicate(value));
+                assert!(idx >= idx_partway);
+                if i >= idx_partway.as_usize() {
+                    assert_eq!(idx.as_usize() as u16, value);
+                } else {
+                    assert!((i as u16) < value);
+                }
+            }
+            Err(_) => {
+                assert!(!predicate(partreader.fetch(ivalids.end - 1).unwrap()));
+            }
+        }
+    }
+
+
+
+    // Search for value from start
     for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
         let predicate = |x| x >= i as u16;
         match reader.search(&predicate, true) {
             Ok(idx) => {
-                let _next = reader.fetch_next_item(false);
                 let value = reader.fetch(idx).unwrap();
                 assert!(predicate(value));
-                if idx >= ivalids.start {
+                if i >= ivalids.start.as_usize() {
                     assert_eq!(idx.as_usize() as u16, value);
+                } else {
+                    assert!((i as u16) < value);
                 }
-
-                // assert_eq!(reader.fetch_next_item(false), RR::Success(i));
-                // FIXME assert that the previous index is either before the start or gives lamb = false
             }
             Err(_) => {
                 assert!(!predicate(reader.fetch(ivalids.end - 1).unwrap()));
             }
         }
     }
+
+
 }
 
 macro_rules! assert_let {

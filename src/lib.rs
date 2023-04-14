@@ -71,6 +71,7 @@ pub struct CBuf<T: CBufItem, const SIZE: usize> {
 /// the [`CBufIndex<SIZE>`] used for [`fetch`](Self::fetch) (or used interally by
 /// the [`CBufReader`] in [`fetch_next_item`](Self::fetch_next_item)) may become out-of-date, with
 /// a newer element in place of the element referred to by the index.
+#[derive(Clone)]
 pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
     /// Pointer to the [`CBuf`]'s backing array.
     buf:        *const T,
@@ -520,13 +521,15 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         self.next_local
     }
 
-    /// Sets the index used for sequential reads.
+    /// New `CBufReader` with the sequential read index at value.
     ///
     /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
     /// and [`available_items_iter`](Self::available_items_iter)).
     #[inline]
-    pub fn set_next_index(&mut self, next: CBufIndex<SIZE>) {
-        self.next_local = next;
+    pub fn reader_stating_at(&self, next: CBufIndex<SIZE>) -> Self {
+        let mut result = self.clone();
+        result.next_local = next;
+        result
     }
 
     /// Finds the earliest valid index that makes the predicate true
@@ -573,7 +576,6 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         // At this point, ifalse < itrue and index to false and true values
 
         while ifalse + 1 < itrue {
-            // let imid = ifalse + (ifalse.signed_offset_to(&itrue) as usize) / 2;
             let imid;
             if let Some(didx) = itrue - ifalse {
                 imid = ifalse + didx / 2
@@ -627,7 +629,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     pub fn fetch_with_index(&self, idx: CBufIndex<SIZE>) -> FetchWithIndexResult<T, SIZE> {
         let mut idx_try = idx;
         for _ in 0..Self::NUM_READ_TRIES {
-            match self.fetch_seq(idx_try, &()) {
+            match self.fetch(idx_try) {
                 Ok(t) => {
                     return if idx_try == idx {
                         FetchWithIndexResult::Success(t, idx_try)
