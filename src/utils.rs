@@ -236,29 +236,6 @@ impl<const SIZE: usize> CBufIndex<SIZE> {
             }
         }
     }
-
-    /// Signed value that must be added to `self` to give the other.
-    #[inline]
-    pub fn signed_offset_to(self, other: &Self) -> isize {
-        const HALFSIZE: usize = (usize::MAX - 1) / 2;
-        let mut udelta = other.idx.wrapping_sub(self.idx);
-        if udelta < HALFSIZE {
-            // offset is positive, but might be a wrap
-            if other.idx < HALFSIZE && self.idx > HALFSIZE && other.idx > SIZE {
-                udelta -= SIZE;
-            }
-            udelta as isize
-        } else {
-            // This should not check ranges, according to
-            // https://doc.rust-lang.org/reference/expressions/operator-expr.html#type-cast-expressions
-            let mut idelta = udelta as isize;
-            // Offset is negative, but might be a wrap
-            if other.idx > HALFSIZE && self.idx < HALFSIZE && self.idx >= SIZE {
-                idelta += SIZE as isize
-            }
-            idelta
-        }
-    }
 }
 
 /// An interface for splitting an object into two smaller parts.
