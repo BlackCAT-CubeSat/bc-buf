@@ -1,4 +1,4 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
+// Copyright (c) 2022-2023 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Utility types used in conjunction with [`CBuf`]s and their readers and writers.
@@ -43,12 +43,11 @@ use std::sync::mpsc;
 //   * the next item will be written to cb.buf[idx & (SIZE-1)]
 //   * once the next item has been written, the next value of cb.next will be max(idx.wrapping_add(1), SIZE)
 
-// Ordering and arithmetic:
+// Ordering:
 // CBufIndex<SIZE> is 'locally ordered' in the sense that two indices can be
-// validly compared if they are within half the possible index range of each other.
-// If one index was written more than (usize::MAX - SIZE)/2 after the other, then
-// the comparison may be incorrect.  Likewise signed_offset may be incorrect if
-// the correct value is outside of the valid range of [isize::MIN + SIZE, isize::MAX - SIZE]
+// validly compared if they are within ~a quarter the possible index range of each other.
+// If one index was written more than usize::MAX/4 after the other, then
+// the comparison may be incorrect, so our PartialOrd implementation returns None then.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct CBufIndex<const SIZE: usize> {
     idx: usize,
@@ -88,11 +87,42 @@ impl<const SIZE: usize> Default for CBufIndex<SIZE> {
     }
 }
 
-/// Ordering for `CBufIndex<SIZE>`
+const MAX_COMPARABLE_DIFF: usize = usize::MAX / 4;
+
 impl<const SIZE: usize> PartialOrd for CBufIndex<SIZE> {
+    // A little complex? Yes.
+    // This is what we get for making a pointer-sized integer do triple duty.
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        let idelta: isize = other.idx.wrapping_sub(self.idx) as isize;
-        idelta.partial_cmp(&0isize)
+        if self.idx < SIZE {
+            if other.idx > MAX_COMPARABLE_DIFF + SIZE {
+                return None;
+            }
+            let delta = self.idx.wrapping_sub(other.idx) as isize;
+            if delta.unsigned_abs() > MAX_COMPARABLE_DIFF {
+                return None;
+            }
+            delta.partial_cmp(&0isize)
+        } else {
+            if self.idx > MAX_COMPARABLE_DIFF + SIZE && other.idx < SIZE {
+                return None;
+            }
+            let delta = self.idx.wrapping_sub(other.idx) as isize;
+
+            // correct for wrap-around:
+            let delta = if delta > 0 && other.idx > self.idx {
+                delta - (SIZE as isize)
+            } else if delta < 0 && other.idx < self.idx {
+                delta + (SIZE as isize)
+            } else {
+                delta
+            };
+
+            if delta.unsigned_abs() > MAX_COMPARABLE_DIFF {
+                return None;
+            }
+            delta.partial_cmp(&0isize)
+        }
     }
 }
 
@@ -387,6 +417,7 @@ impl<T: Send> Sequencer<T> for TestSequencer<T> {
 #[cfg(test)]
 mod index_tests {
     use super::CBufIndex;
+    use core::cmp::Ordering;
 
     const M: usize = usize::MAX;
 
@@ -1020,6 +1051,104 @@ mod index_tests {
             M-6  ;     T          T          T         T         T   ;
             M-5  ;     T          T          T         T         T   ;
             M-4  ;     T          T          T         T         T   ;
+        );
+    }
+
+    macro_rules! partial_cmp_tableau {
+        (@ assert $a:expr, $b:expr, $expected_result:expr) => {
+            let result = CBufIndex::<16>::new($a).partial_cmp(&CBufIndex::<16>::new($b));
+            assert!(
+                result == $expected_result,
+                "\nassertion failed: (CBufIndex({}) partial_cmp CBufIndex({})) == {:?}\n    Left: {:?}\n    Right: {:?}\n",
+                stringify!($a),
+                stringify!($b),
+                $expected_result,
+                result,
+                $expected_result
+            );
+        };
+        (@ op N) => { None::<Ordering> };
+        (@ op <) => { Some(Ordering::Less) };
+        (@ op =) => { Some(Ordering::Equal) };
+        (@ op >) => { Some(Ordering::Greater) };
+        (@ single $lhs:expr, $rhs:expr, $expected_result:expr) => {
+            // following println! is useful to debug the macro:
+            //std::println!("test: {} {} {}", stringify!($lhs), stringify!($rhs), stringify!($expected_result));
+
+            partial_cmp_tableau!(@ assert $lhs, $rhs, $expected_result);
+            // test duality as well:
+            partial_cmp_tableau!(@ assert $rhs, $lhs, $expected_result.map(Ordering::reverse));
+        };
+        (@ row $lhs:expr, ( $($rhs:expr)* ) ( $($result:tt)* ) ) => {
+            $( partial_cmp_tableau!(@ single $lhs, $rhs, partial_cmp_tableau!(@ op $result)); )*
+        };
+        (@ all_rows $rhs:tt, $( $lhs:expr ; $results:tt )* ) => {
+            $(
+                partial_cmp_tableau!(@ row $lhs, $rhs $results);
+            )*
+        };
+        ($($rhs:expr)* ; $( $lhs:expr ; ( $($result:tt)* ) )* ) => {
+            partial_cmp_tableau!(@ all_rows ( $($rhs)* ), $( $lhs ; ( $($result)* ) )* );
+        };
+    }
+
+    #[rustfmt::skip]
+    #[test]
+    fn partial_cmp_tests() {
+        const M: usize = usize::MAX;
+        const H: usize = usize::MAX / 2;
+        const Q: usize = super::MAX_COMPARABLE_DIFF;
+
+        const S: usize = 16;
+
+        // Tests to work out partial_cmp_tableau itself:
+        partial_cmp_tableau!(@ single 0, 0, Some(Ordering::Equal));
+        partial_cmp_tableau!(@ single 1, 0, Some(Ordering::Greater));
+        partial_cmp_tableau!(@ row 1, ( 0 1 2 3 M ) ( > = < < N ));
+        partial_cmp_tableau!(
+                 0 1 2 ;
+            0; ( = < < )
+            1; ( > = < )
+        );
+
+        // Now, for the real tests!
+
+        // First off, testing comparisons for indices below and near SIZE:
+        partial_cmp_tableau!(
+                   0 1 2  S-1 S S+1 S+2  Q-1 Q Q+1 Q+2  Q+S-1 Q+S Q+S+1  M-Q M-Q+1 M-Q+2  M-2 M-1 M ;
+              0; ( = < <   <  <  <   <    <  <  N   N     N    N    N     N    N     N     N   N  N )
+              1; ( > = <   <  <  <   <    <  <  <   N     N    N    N     N    N     N     N   N  N )
+              2; ( > > =   <  <  <   <    <  <  <   <     N    N    N     N    N     N     N   N  N )
+
+            S-1; ( > > >   =  <  <   <    <  <  <   <     <    N    N     N    N     N     N   N  N )
+              S; ( > > >   >  =  <   <    <  <  <   <     <    <    N     N    >     >     >   >  > )
+            S+1; ( > > >   >  >  =   <    <  <  <   <     <    <    <     N    N     >     >   >  > )
+        );
+
+        // For indices near usize::MAX / 2:
+        partial_cmp_tableau!(
+                     0 1 2  S-1 S S+1  H-Q-1 H-Q H-Q+1  H-S-1 H-S H-S+1  H-1 H H+1  H+S-1 H+S H+S+1  H+Q-1 H+Q H+Q+1  M-1 M ;
+              H-S; ( N N N   N  N  N     >    >    >      >    =    <     <  <  <     <    <    <      N    N    N     N  N )
+            H-S+1; ( N N N   N  N  N     >    >    >      >    >    =     <  <  <     <    <    <      N    N    N     N  N )
+
+              H-1; ( N N N   N  N  N     >    >    >      >    >    >     =  <  <     <    <    <      <    N    N     N  N )
+                H; ( N N N   N  N  N     N    >    >      >    >    >     >  =  <     <    <    <      <    <    N     N  N )
+              H+1; ( N N N   N  N  N     N    N    >      >    >    >     >  >  =     <    <    <      <    <    <     N  N )
+
+            H+S-1; ( N N N   N  N  N     N    N    N      >    >    >     >  >  >     =    <    <      <    <    <     N  N )
+              H+S; ( N N N   N  N  N     N    N    N      >    >    >     >  >  >     >    =    <      <    <    <     N  N )
+        );
+
+        // For indices near usize::MAX:
+        partial_cmp_tableau!(
+                     M-Q-1 M-Q M-Q+1  M-S-1 M-S M-S+1  M-2 M-1 M   0 1 2  S-1 S S+1  Q-2 Q-1 Q Q+1  Q+S-2 Q+S-1 Q+S Q+S+1 ;
+            M-S-1; (   >    >    >      =    <    <     <   <  <   N N N   N  <  <    <   N  N  N     N     N    N    N   )
+              M-S; (   >    >    >      >    =    <     <   <  <   N N N   N  <  <    <   <  N  N     N     N    N    N   )
+            M-S+1; (   >    >    >      >    >    =     <   <  <   N N N   N  <  <    <   <  <  N     N     N    N    N   )
+
+              M-2; (   >    >    >      >    >    >     =   <  <   N N N   N  <  <    <   <  <  <     N     N    N    N   )
+              M-1; (   >    >    >      >    >    >     >   =  <   N N N   N  <  <    <   <  <  <     <     N    N    N   )
+                M; (   N    >    >      >    >    >     >   >  =   N N N   N  <  <    <   <  <  <     <     <    N    N   )
         );
     }
 }

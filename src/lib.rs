@@ -1,4 +1,4 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
+// Copyright (c) 2022-2023 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Nonblocking single-writer, multiple-reader,
@@ -576,9 +576,9 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
             // let imid = ifalse + (ifalse.signed_offset_to(&itrue) as usize) / 2;
             let imid;
             if let Some(didx) = itrue - ifalse {
-                imid = ifalse + didx/2
+                imid = ifalse + didx / 2
             } else {
-                return Err(InvalidIndexError(()))
+                return Err(InvalidIndexError(()));
             }
 
             match self.fetch_with_index(imid) {

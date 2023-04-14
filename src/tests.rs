@@ -1,4 +1,4 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
+// Copyright (c) 2022-2023 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tests of the reader and writer protocols.
