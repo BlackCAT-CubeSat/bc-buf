@@ -521,7 +521,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         self.next_local
     }
 
-    /// New `CBufReader` with the sequential read index at value.
+    /// Returns new `CBufReader` with the sequential read index set to `next`.
     ///
     /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
     /// and [`available_items_iter`](Self::available_items_iter)).
@@ -532,8 +532,10 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         result
     }
 
-    /// Finds the earliest valid index that makes the predicate true
-    /// assuming buffer contents are sorted by `predicate()` in `false`, `true` order.
+    /// Returns new `CBufReader` with the sequential read index starting at
+    /// the first item that makes the predicate true.
+    /// 
+    /// Requires that buffer contents are sorted by `predicate()` in `false`, `true` order.
     ///
     /// If `fromstart` is set, searches all available data, otherwise
     /// the search starts at the `current_next_index()`.
@@ -549,13 +551,13 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         &self,
         predicate: &dyn Fn(T) -> bool,
         fromstart: bool,
-    ) -> Result<CBufIndex<SIZE>, InvalidIndexError> {
+    ) -> Result<Self, InvalidIndexError> {
         let valids = self.current_valid_index_range();
         let mut ifalse = if fromstart { valids.start } else { self.next_local };
         match self.fetch_with_index(ifalse) {
             FetchWithIndexResult::Success(v, idx) | FetchWithIndexResult::Skipped(v, idx) => {
                 if predicate(v) {
-                    return Ok(idx);
+                    return Ok(self.reader_stating_at(idx));
                 }
                 ifalse = idx
             }
@@ -598,7 +600,7 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
                 }
             }
         }
-        return Ok(itrue);
+        return Ok(self.reader_stating_at(itrue));
     }
 
     /// Returns the half-open range of valid indexes for items currently in the circular buffer.

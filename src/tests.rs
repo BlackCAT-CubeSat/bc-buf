@@ -144,7 +144,7 @@ fn write_then_read() {
 }
 
 #[test]
-fn write_wrap_read() {
+fn write_wrap_read_search() {
     const SZ: usize = 16;
     let mut cbuf: CBuf<u16, SZ> = CBuf::new(9999);
 
@@ -182,15 +182,21 @@ fn write_wrap_read() {
     }
     assert_eq!(i, 3 * SZ as u16);
 
-
     // Search for value no earlier than a read index
     let idx_partway = ivalids.start + 10;
     let partreader = reader.reader_stating_at(idx_partway);
-        for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
+    for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
         let predicate = |x| x >= i as u16;
         match partreader.search(&predicate, false) {
-            Ok(idx) => {
-                let value = partreader.fetch(idx).unwrap();
+            Ok(mut foundreader) => {
+                let idx = foundreader.current_next_index();
+                let value = match foundreader.fetch_next_item(false) {
+                    RR::Success(value) => value,
+                    _ => {
+                        panic!("Read after reduced search failed at {}", idx.as_usize());
+                    }
+                };
+                assert_eq!(value, reader.fetch(idx).unwrap());
                 assert!(predicate(value));
                 assert!(idx >= idx_partway);
                 if i >= idx_partway.as_usize() {
@@ -205,14 +211,18 @@ fn write_wrap_read() {
         }
     }
 
-
-
     // Search for value from start
     for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
         let predicate = |x| x >= i as u16;
         match reader.search(&predicate, true) {
-            Ok(idx) => {
-                let value = reader.fetch(idx).unwrap();
+            Ok(mut foundreader) => {
+                let idx = foundreader.current_next_index();
+                let value = match foundreader.fetch_next_item(false) {
+                    RR::Success(value) => value,
+                    _ => {
+                        panic!("Read after full search failed at {}", idx.as_usize());
+                    }
+                };
                 assert!(predicate(value));
                 if i >= ivalids.start.as_usize() {
                     assert_eq!(idx.as_usize() as u16, value);
@@ -225,8 +235,6 @@ fn write_wrap_read() {
             }
         }
     }
-
-
 }
 
 macro_rules! assert_let {
