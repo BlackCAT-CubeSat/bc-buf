@@ -521,9 +521,9 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         self.next_local
     }
 
-    /// Returns new `CBufReader` with the sequential read index set to `next`.
+    /// Returns a new `CBufReader` with the sequential read index set to `next`.
     ///
-    /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
+    /// (c.f. [`fetch_next_item`](Self::fetch_next_item)
     /// and [`available_items_iter`](Self::available_items_iter)).
     #[inline]
     pub fn reader_stating_at(&self, next: CBufIndex<SIZE>) -> Self {
@@ -532,10 +532,11 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         result
     }
 
-    /// Returns new `CBufReader` with the sequential read index starting at
+    /// Returns a new `CBufReader` with the sequential read index starting at
     /// the first item that makes the predicate true.
-    /// 
-    /// Requires that buffer contents are sorted by `predicate()` in `false`, `true` order.
+    ///
+    /// Requires that the buffer contents are sorted by
+    /// `predicate()` in `false`, `true` order.
     ///
     /// If `fromstart` is set, searches all available data, otherwise
     /// the search starts at the `current_next_index()`.
