@@ -1,4 +1,4 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
+// Copyright (c) 2022-2023 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Nonblocking single-writer, multiple-reader,
@@ -71,6 +71,7 @@ pub struct CBuf<T: CBufItem, const SIZE: usize> {
 /// the [`CBufIndex<SIZE>`] used for [`fetch`](Self::fetch) (or used interally by
 /// the [`CBufReader`] in [`fetch_next_item`](Self::fetch_next_item)) may become out-of-date, with
 /// a newer element in place of the element referred to by the index.
+#[derive(Clone)]
 pub struct CBufReader<'a, T: CBufItem, const SIZE: usize> {
     /// Pointer to the [`CBuf`]'s backing array.
     buf:        *const T,
@@ -170,6 +171,8 @@ impl<T: CBufItem, const SIZE: usize> CBuf<T, SIZE> {
     }
 
     /// Returns a [`CBufReader`] for reading elements from `self`.
+    ///
+    /// `next_index` for reading is initialized to end of available data.
     #[inline]
     pub fn as_reader<'a>(&'a self) -> CBufReader<'a, T, SIZE> {
         CBufReader {
@@ -501,12 +504,104 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
         self.next_local = self.next_ref.load(SeqCst);
     }
 
+    /// Resets the [`CBufReader`]'s internal current index
+    /// (as used by [`fetch_next_item`](Self::fetch_next_item)
+    /// and returned by [`current_next_index`](Self::current_next_index))
+    /// to the earliest available item in the buffer.
+    #[inline]
+    pub fn rewind(&mut self) {
+        self.next_local = self.next_ref.load(SeqCst) - (SIZE - 1);
+    }
+
     /// Returns the current value of the index used for sequential reads
     /// (i.e., [`fetch_next_item`](Self::fetch_next_item)
     /// and [`available_items_iter`](Self::available_items_iter)).
     #[inline]
     pub fn current_next_index(&self) -> CBufIndex<SIZE> {
         self.next_local
+    }
+
+    /// Returns a new `CBufReader` with the sequential read index set to `next`.
+    ///
+    /// (c.f. [`fetch_next_item`](Self::fetch_next_item)
+    /// and [`available_items_iter`](Self::available_items_iter)).
+    #[inline]
+    pub fn reader_stating_at(&self, next: CBufIndex<SIZE>) -> Self {
+        let mut result = self.clone();
+        result.next_local = next;
+        result
+    }
+
+    /// Returns a new `CBufReader` with the sequential read index starting at
+    /// the first item that makes the predicate true.
+    ///
+    /// Requires that the buffer contents are sorted by
+    /// `predicate()` in `false`, `true` order.
+    ///
+    /// If `fromstart` is set, searches all available data, otherwise
+    /// the search starts at the `current_next_index()`.
+    ///
+    /// Returns `InvalidIndexError` if no such index exists.
+    ///
+    /// If data is not sorted by `predicate()` (i.e. if at least one
+    /// item that makes the predicate `false` is later than at
+    /// least one item that makes the predicate `true`) the
+    /// function may return either an index that makes the predicate
+    /// true, or an `InvalidIndexError`.
+    pub fn search(
+        &self,
+        predicate: &dyn Fn(T) -> bool,
+        fromstart: bool,
+    ) -> Result<Self, InvalidIndexError> {
+        let valids = self.current_valid_index_range();
+        let mut ifalse = if fromstart { valids.start } else { self.next_local };
+        match self.fetch_with_index(ifalse) {
+            FetchWithIndexResult::Success(v, idx) | FetchWithIndexResult::Skipped(v, idx) => {
+                if predicate(v) {
+                    return Ok(self.reader_stating_at(idx));
+                }
+                ifalse = idx
+            }
+            FetchWithIndexResult::None | FetchWithIndexResult::SpinFail => {
+                return Err(InvalidIndexError(()))
+            }
+        };
+        let mut itrue = valids.end - 1;
+        // Verify that the predicate is true at the end
+        match self.fetch(itrue) {
+            Ok(v) => {
+                if !predicate(v) {
+                    return Err(InvalidIndexError(()));
+                }
+            }
+            Err(_) => return Err(InvalidIndexError(())),
+        }
+        // At this point, ifalse < itrue and index to false and true values
+
+        while ifalse + 1 < itrue {
+            let imid;
+            if let Some(didx) = itrue - ifalse {
+                imid = ifalse + didx / 2
+            } else {
+                return Err(InvalidIndexError(()));
+            }
+
+            match self.fetch_with_index(imid) {
+                FetchWithIndexResult::Success(v, idx) | FetchWithIndexResult::Skipped(v, idx) => {
+                    if predicate(v) {
+                        itrue = idx;
+                    } else {
+                        ifalse = idx;
+                    }
+                }
+                FetchWithIndexResult::None | FetchWithIndexResult::SpinFail => {
+                    // Not strictly accurate:  This is when the writer overtakes
+                    // the data being searched.
+                    return Err(InvalidIndexError(()));
+                }
+            }
+        }
+        return Ok(self.reader_stating_at(itrue));
     }
 
     /// Returns the half-open range of valid indexes for items currently in the circular buffer.
@@ -527,6 +622,34 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufReader<'a, T, SIZE> {
     #[inline(always)]
     pub fn fetch(&self, idx: CBufIndex<SIZE>) -> Result<T, InvalidIndexError> {
         self.fetch_seq(idx, &())
+    }
+
+    /// Tries to read the item at index `idx` in the buffer and return both a value and the index actually read.
+    ///
+    /// If successful, or if it had to skip forward to the earliest item, returns the item and its index.
+    /// Can fail due to index beyond end (`None`) or spinlock.
+    #[inline]
+    pub fn fetch_with_index(&self, idx: CBufIndex<SIZE>) -> FetchWithIndexResult<T, SIZE> {
+        let mut idx_try = idx;
+        for _ in 0..Self::NUM_READ_TRIES {
+            match self.fetch(idx_try) {
+                Ok(t) => {
+                    return if idx_try == idx {
+                        FetchWithIndexResult::Success(t, idx_try)
+                    } else {
+                        FetchWithIndexResult::Skipped(t, idx_try)
+                    }
+                }
+                Err(InvalidIndexError(())) => {
+                    let valids = self.current_valid_index_range();
+                    if idx_try >= valids.end {
+                        return FetchWithIndexResult::None;
+                    }
+                    idx_try = valids.start
+                }
+            }
+        }
+        FetchWithIndexResult::SpinFail
     }
 
     /// The backing logic for [`fetch`](Self::fetch).
@@ -587,6 +710,19 @@ pub enum ReadResult<T> {
     Success(T),
     /// Fetched an item, but we missed some number.
     Skipped(T),
+    /// No new items are available.
+    None,
+    /// After trying [`CBufReader::NUM_READ_TRIES`] times, not able to successfully read an item.
+    SpinFail,
+}
+
+/// The return value of [`CBufReader::fetch_with_index`]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum FetchWithIndexResult<T, const SIZE: usize> {
+    /// Normal case; fetched next item.
+    Success(T, CBufIndex<SIZE>),
+    /// Fetched an item, but we missed some number.
+    Skipped(T, CBufIndex<SIZE>),
     /// No new items are available.
     None,
     /// After trying [`CBufReader::NUM_READ_TRIES`] times, not able to successfully read an item.

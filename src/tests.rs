@@ -1,4 +1,4 @@
-// Copyright (c) 2022 The Pennsylvania State University and the project contributors.
+// Copyright (c) 2022-2023 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tests of the reader and writer protocols.
@@ -141,6 +141,100 @@ fn write_then_read() {
     assert_eq!(reader2.fetch_next_item(true), RR::Skipped(300));
 
     drop(cbuf);
+}
+
+#[test]
+fn write_wrap_read_search() {
+    const SZ: usize = 16;
+    let mut cbuf: CBuf<u16, SZ> = CBuf::new(9999);
+
+    let ivalids = cbuf.as_reader().current_valid_index_range();
+    assert_eq!(ivalids.start.as_usize(), 0);
+    assert_eq!(ivalids.end.as_usize(), 0);
+
+    let mut writer = cbuf.as_writer();
+
+    for i in 0u16..3 * (SZ as u16) {
+        writer.add_item(i);
+    }
+
+    let mut reader = cbuf.as_reader();
+
+    let ivalids = reader.current_valid_index_range();
+
+    assert_eq!(ivalids.start.as_usize(), 2 * SZ + 1);
+    assert_eq!(ivalids.end.as_usize(), 3 * SZ);
+
+    // reader.set_next_index(ivalids.start);
+    reader.rewind();
+
+    let mut i = ivalids.start.as_usize() as u16;
+    for value in reader.available_items_iter(false) {
+        match value {
+            RR::Success(v) => {
+                assert_eq!(v, i);
+                i += 1;
+            }
+            _ => {
+                panic!("Read back failed at {}: {:?}", i, value);
+            }
+        }
+    }
+    assert_eq!(i, 3 * SZ as u16);
+
+    // Search for value no earlier than a read index
+    let idx_partway = ivalids.start + 10;
+    let partreader = reader.reader_stating_at(idx_partway);
+    for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
+        let predicate = |x| x >= i as u16;
+        match partreader.search(&predicate, false) {
+            Ok(mut foundreader) => {
+                let idx = foundreader.current_next_index();
+                let value = match foundreader.fetch_next_item(false) {
+                    RR::Success(value) => value,
+                    _ => {
+                        panic!("Read after reduced search failed at {}", idx.as_usize());
+                    }
+                };
+                assert_eq!(value, reader.fetch(idx).unwrap());
+                assert!(predicate(value));
+                assert!(idx >= idx_partway);
+                if i >= idx_partway.as_usize() {
+                    assert_eq!(idx.as_usize() as u16, value);
+                } else {
+                    assert!((i as u16) < value);
+                }
+            }
+            Err(_) => {
+                assert!(!predicate(partreader.fetch(ivalids.end - 1).unwrap()));
+            }
+        }
+    }
+
+    // Search for value from start
+    for i in ivalids.start.as_usize() - 1..ivalids.end.as_usize() + 1 {
+        let predicate = |x| x >= i as u16;
+        match reader.search(&predicate, true) {
+            Ok(mut foundreader) => {
+                let idx = foundreader.current_next_index();
+                let value = match foundreader.fetch_next_item(false) {
+                    RR::Success(value) => value,
+                    _ => {
+                        panic!("Read after full search failed at {}", idx.as_usize());
+                    }
+                };
+                assert!(predicate(value));
+                if i >= ivalids.start.as_usize() {
+                    assert_eq!(idx.as_usize() as u16, value);
+                } else {
+                    assert!((i as u16) < value);
+                }
+            }
+            Err(_) => {
+                assert!(!predicate(reader.fetch(ivalids.end - 1).unwrap()));
+            }
+        }
+    }
 }
 
 macro_rules! assert_let {
