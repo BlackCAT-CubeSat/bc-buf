@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2023 The Pennsylvania State University and the project contributors.
+// Copyright (c) 2022-2024 The Pennsylvania State University and the project contributors.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Nonblocking single-writer, multiple-reader,
@@ -315,6 +315,16 @@ impl<'a, T: CBufItem, const SIZE: usize> CBufWriter<'a, T, SIZE> {
             buf:         unsafe { &*(self.buf as *const [T; SIZE]) },
             idx:         self.next_local - (SIZE - 1),
             _writer:     self,
+        }
+    }
+
+    /// Returns a [`CBufReader<T, SIZE>`] for this circular buffer.
+    #[inline]
+    pub fn as_reader<'b>(&'b mut self) -> CBufReader<'b, T, SIZE> {
+        CBufReader {
+            buf:        self.buf,
+            next_ref:   self.next_ref,
+            next_local: self.next_local - (SIZE - 1),
         }
     }
 }
